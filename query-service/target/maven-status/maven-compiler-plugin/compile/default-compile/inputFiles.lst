@@ -1,0 +1,8 @@
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/QueryServiceApplication.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/domain/ProcessedLogEntity.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/repository/ProcessedLogRepository.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/service/LogNotFoundException.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/service/LogQueryService.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/web/ApiExceptionHandler.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/web/LogQueryController.java
+/home/kalpesh/Videos/log-platform/query-service/src/main/java/com/logplatform/query/web/LogResponse.java

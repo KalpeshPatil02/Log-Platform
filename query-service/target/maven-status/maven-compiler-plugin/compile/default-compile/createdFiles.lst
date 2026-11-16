@@ -1,0 +1,8 @@
+com/logplatform/query/QueryServiceApplication.class
+com/logplatform/query/web/LogResponse.class
+com/logplatform/query/service/LogQueryService.class
+com/logplatform/query/domain/ProcessedLogEntity.class
+com/logplatform/query/service/LogNotFoundException.class
+com/logplatform/query/web/ApiExceptionHandler.class
+com/logplatform/query/repository/ProcessedLogRepository.class
+com/logplatform/query/web/LogQueryController.class

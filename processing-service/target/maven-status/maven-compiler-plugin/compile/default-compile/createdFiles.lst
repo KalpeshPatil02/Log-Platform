@@ -1,0 +1,15 @@
+com/logplatform/processing/persistence/ProcessedLogEntity.class
+com/logplatform/processing/service/LogProcessingService.class
+com/logplatform/processing/config/ProcessingProperties.class
+com/logplatform/processing/service/LogNormalizer.class
+com/logplatform/processing/ProcessingServiceApplication.class
+com/logplatform/processing/persistence/OutboxEventRepository.class
+com/logplatform/processing/outbox/OutboxPublisher.class
+com/logplatform/processing/domain/NormalizedLog.class
+com/logplatform/processing/domain/RawLogEvent.class
+com/logplatform/processing/config/PropertiesConfig.class
+com/logplatform/processing/stream/PendingRecoveryJob.class
+com/logplatform/processing/stream/RedisStreamConsumer.class
+com/logplatform/processing/persistence/OutboxEventEntity.class
+com/logplatform/processing/outbox/OutboxTransactionService.class
+com/logplatform/processing/persistence/ProcessedLogRepository.class

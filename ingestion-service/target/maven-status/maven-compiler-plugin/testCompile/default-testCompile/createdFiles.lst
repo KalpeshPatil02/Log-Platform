@@ -1,0 +1,4 @@
+com/logplatform/ingestion/service/ApiKeyResolverTest.class
+com/logplatform/ingestion/IngestionIT.class
+com/logplatform/ingestion/RedisDownTest.class
+com/logplatform/ingestion/service/LogProducerTest.class

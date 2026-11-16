@@ -1,0 +1,3 @@
+package com.logplatform.alert.repository;
+import com.logplatform.alert.domain.NotificationOutboxEntity; import org.springframework.data.jpa.repository.JpaRepository; import org.springframework.data.jpa.repository.Query; import org.springframework.data.repository.query.Param; import java.time.Instant; import java.util.List;
+public interface NotificationOutboxRepository extends JpaRepository<NotificationOutboxEntity,Long>{ @Query(value="SELECT * FROM notification_outbox WHERE status='PENDING' AND next_attempt_at <= :now ORDER BY id LIMIT :lim",nativeQuery=true) List<NotificationOutboxEntity> due(@Param("now") Instant now,@Param("lim") int lim); }

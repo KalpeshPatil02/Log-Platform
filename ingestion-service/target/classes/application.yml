@@ -1,0 +1,39 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: ingestion-service
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      timeout: 2s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+platform:
+  web:
+    max-request-bytes: 5242880      # 5 MB hard cap on any request body (common-web RequestSizeLimitFilter)
+
+logging:
+  pattern:
+    level: "%5p [%X{correlationId:-}]"
+
+ingestion:
+  identity-url: ${IDENTITY_URL:http://localhost:8081}
+  internal-token: ${INTERNAL_TOKEN}   # must equal identity.internal-token
+  max-stream-length: ${MAX_STREAM_LENGTH:100000}          # backpressure high-water mark for logs.raw
+  dedup-ttl: 24h
+  require-event-id: ${INGESTION_REQUIRE_EVENT_ID:false}                                          # how long a client-supplied eventId is remembered
+  cache:
+    valid-ttl: 5m
+    invalid-ttl: 30s

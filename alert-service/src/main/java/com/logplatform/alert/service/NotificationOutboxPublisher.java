@@ -1,0 +1,7 @@
+package com.logplatform.alert.service;
+import com.logplatform.alert.config.AlertProperties; import com.logplatform.alert.domain.NotificationOutboxEntity; import com.logplatform.alert.repository.NotificationOutboxRepository; import org.springframework.data.redis.connection.stream.MapRecord; import org.springframework.data.redis.connection.stream.StreamRecords; import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.scheduling.annotation.Scheduled; import org.springframework.stereotype.Component; import org.springframework.transaction.annotation.Transactional; import java.time.Instant; import java.util.*;
+@Component public class NotificationOutboxPublisher {
+ private final NotificationOutboxRepository repo; private final StringRedisTemplate redis; private final AlertProperties props;
+ public NotificationOutboxPublisher(NotificationOutboxRepository r,StringRedisTemplate redis,AlertProperties p){repo=r;this.redis=redis;props=p;}
+ @Scheduled(fixedDelayString="${ALERT_OUTBOX_POLL_MS:2000}") @Transactional public void publish(){for(NotificationOutboxEntity e:repo.due(Instant.now(),50)){try{Map<String,String> body=Map.of("eventKey",e.getEventKey(),"tenantId",String.valueOf(e.getTenantId()),"payload",e.getPayload());MapRecord<String,String,String> record=StreamRecords.newRecord().in(props.notificationStream()).ofMap(body);redis.opsForStream().add(record);e.published(Instant.now());}catch(Exception ex){long delay=Math.min(3600,1L<<Math.min(12,e.getAttempts()));e.failed(ex.getMessage(),Instant.now().plusSeconds(delay));}}}
+}

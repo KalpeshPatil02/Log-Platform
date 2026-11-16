@@ -1,0 +1,3 @@
+com/logplatform/gateway/filter/TenantContextGlobalFilterTest.class
+com/logplatform/gateway/filter/CorrelationIdWebFilterTest.class
+com/logplatform/gateway/GatewayIT.class

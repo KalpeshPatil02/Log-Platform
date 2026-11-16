@@ -1,0 +1,3 @@
+package com.logplatform.alert.repository;
+import com.logplatform.alert.domain.IncidentEntity; import org.springframework.data.jpa.repository.JpaRepository; import java.util.*;
+public interface IncidentRepository extends JpaRepository<IncidentEntity,Long>{ Optional<IncidentEntity> findFirstByTenantIdAndFingerprintAndStatusIn(Long tenant,String fp,Collection<String> statuses); Optional<IncidentEntity> findByIdAndTenantId(Long id,Long tenant); List<IncidentEntity> findByTenantIdOrderByLastSeenAtDesc(Long tenant); List<IncidentEntity> findByTenantIdAndStatusOrderByLastSeenAtDesc(Long tenant,String status); }

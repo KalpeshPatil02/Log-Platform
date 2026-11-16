@@ -1,0 +1,161 @@
+name: logplatform
+
+# Phase 0: infrastructure + application services
+services:
+  mysql:
+    image: mysql:8.4
+    mem_limit: 640m
+    command:
+      - "--innodb-buffer-pool-size=256M"
+      - "--performance_schema=OFF"
+      - "--max-connections=100"
+      - "--character-set-server=utf8mb4"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy .env.example to .env}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      PROCESSING_DB_PASSWORD: ${PROCESSING_DB_PASSWORD:?}
+      QUERY_DB_PASSWORD: ${QUERY_DB_PASSWORD:?}
+      ALERT_DB_PASSWORD: ${ALERT_DB_PASSWORD:?}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?}
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.2-alpine
+    mem_limit: 192m
+    # Streams must not be silently evicted.
+    command:
+      - redis-server
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--appendonly"
+      - "yes"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?}"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?}"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG'
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  identity-service:
+    profiles: ["core"]
+    build:
+      context: .
+      args:
+        JAR: identity-service/target/identity-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      DB_URL: jdbc:mysql://mysql:3306/identity_db
+      DB_USERNAME: identity_svc
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:?}
+      IDENTITY_JWT_PRIVATE_KEY_PATH: /keys/private.pem
+      IDENTITY_JWT_PUBLIC_KEY_PATH: /keys/public.pem
+    volumes:
+      - "./secrets:/keys:ro"
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+        
+  alert-service:
+    profiles: ["alerting"]
+    build:
+      context: .
+      dockerfile: alert-service/Dockerfile
+      args:
+        JAR: alert-service/target/alert-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      ALERT_DB_URL: jdbc:mysql://mysql:3306/alert_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      ALERT_DB_USERNAME: alert_svc
+      ALERT_DB_PASSWORD: ${ALERT_DB_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    ports:
+      - "127.0.0.1:8086:8086"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  processing-service:
+    profiles: ["processing"]
+    build:
+      context: .
+      dockerfile: processing-service/Dockerfile
+      args:
+        JAR: processing-service/target/processing-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      PROCESSING_DB_URL: jdbc:mysql://mysql:3306/logs_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      PROCESSING_DB_USERNAME: processing_svc
+      PROCESSING_DB_PASSWORD: ${PROCESSING_DB_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+      PROCESSING_CONSUMER_NAME: ${PROCESSING_CONSUMER_NAME:-processing-1}
+    ports:
+      - "127.0.0.1:8084:8084"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  ingestion-service:
+    profiles: ["ingestion"]
+    build:
+      context: .
+      dockerfile: ingestion-service/Dockerfile
+      args:
+        JAR: ingestion-service/target/ingestion-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+      IDENTITY_URL: http://identity-service:8081
+      INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:?}
+    ports:
+      - "127.0.0.1:8083:8083"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:

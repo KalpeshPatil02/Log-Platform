@@ -1,0 +1,1390 @@
+LOG PLATFORM - ALERT SERVICE TEST REPORT
+======================================================================
+
+
+======================================================================
+TARGET: alert-service
+======================================================================
+
+
+----------------------------------------------------------------------
+FILE: alert-service/Dockerfile
+----------------------------------------------------------------------
+FROM eclipse-temurin:21-jre
+ARG JAR=alert-service/target/alert-service-1.0.0-SNAPSHOT.jar
+COPY ${JAR} /app.jar
+ENTRYPOINT ["java","-jar","/app.jar"]
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/README.md
+----------------------------------------------------------------------
+# Alert Service — Phase 6
+
+This module is added against the actual uploaded `log-platform` source tree (Spring Boot 3.3.4, Java 21, MySQL 8.4, Redis 7.2). It consumes the existing `com.logplatform.common.ProcessedLogEvent` contract from `common-core` and the `logs.processed` stream. It writes only to `alert_db`; it does not modify `logs_db`.
+
+## Implemented
+- Tenant-scoped alert-rule CRUD (severity/service/environment matchers, threshold and time window).
+- Redis sorted-set sliding-window counter (Lua script keeps prune/add/count atomic).
+- Threshold evaluation and deterministic rule/event-dimension fingerprint.
+- Incident creation, duplicate active-incident occurrence updates, acknowledge/assign/resolve endpoints.
+- MySQL notification outbox and retrying publisher to `notifications.out`.
+- Redis consumer group creation, event ACK after DB transaction, malformed/permanent-event DLQ.
+- Flyway schema, Dockerfile, Compose profile, actuator health endpoints.
+
+## Important engineering notes / limitations
+1. This package matches the uploaded code's `ProcessedLogEvent` record exactly: `eventId`, numeric `tenantId`, `timestamp`, `service`, `environment`, `severity`, `message`, `traceId`, `fingerprint`.
+2. Gateway must route `/api/v1/alert-rules/**` and `/api/v1/incidents/**` to `http://alert-service:8086` (or `http://localhost:8086` when running on host). Add those routes to `api-gateway/src/main/resources/application.yml`. The existing Gateway strips spoofed tenant headers and re-adds verified JWT claims. The Alert Service currently treats `X-Tenant-Id` as trusted internal context; do not expose port 8086 publicly in production. For direct host testing, this trust boundary is not secure by itself.
+3. `notification-service` is Phase 7 and is not in this package. This service publishes versioned JSON payloads on `notifications.out` with fields `eventKey`, `tenantId`, and `payload`.
+4. Consumer ACK occurs after the transactional evaluator returns. The implementation is an initial Phase 6 baseline, not a claim of fully verified production-grade pending-message reclaim/concurrency recovery. The consumer group persists pending entries; a dedicated XPENDING/XAUTOCLAIM recovery worker and robust concurrent active-fingerprint locking should be added before declaring Phase 6 production-complete.
+5. Sliding-window counter currently uses a unique member per delivery. To avoid duplicate-delivery inflation in a strict production system, persist/claim event idempotency per tenant/rule or use a deterministic sorted-set member and update it atomically. Do not treat this baseline as exactly-once processing.
+
+## Build and run
+From the project root:
+
+```bash
+mvn -pl alert-service -am clean test
+mvn -pl alert-service -am package -DskipTests
+```
+
+Start MySQL and Redis first (`docker compose up -d mysql redis`). Ensure `.env` has `ALERT_DB_PASSWORD` and `REDIS_PASSWORD`, and the MySQL init scripts create `alert_db` plus `alert_svc` with the grants shown in the integration SQL. Then:
+
+```bash
+docker compose --profile alerting up -d --build alert-service
+# or run on host after dependencies are available:
+ALERT_DB_URL='jdbc:mysql://127.0.0.1:3307/alert_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC' ALERT_DB_USERNAME=alert_svc ALERT_DB_PASSWORD='your-local-value' REDIS_HOST=127.0.0.1 REDIS_PASSWORD='your-local-value' mvn -pl alert-service spring-boot:run
+```
+
+Health: `GET http://localhost:8086/actuator/health`.
+
+## API
+All tenant-scoped endpoints require trusted `X-Tenant-Id` context from the Gateway.
+
+- `POST /api/v1/alert-rules`
+- `GET /api/v1/alert-rules`
+- `PUT /api/v1/alert-rules/{id}`
+- `DELETE /api/v1/alert-rules/{id}` (soft-disable)
+- `GET /api/v1/incidents?status=OPEN`
+- `GET /api/v1/incidents/{id}`
+- `POST /api/v1/incidents/{id}/acknowledge`
+- `POST /api/v1/incidents/{id}/assign` body `{"value":"on-call"}`
+- `POST /api/v1/incidents/{id}/resolve`
+
+Example rule:
+
+```json
+{"name":"Payment API errors","description":"5 errors in 60 seconds","severity":"ERROR","serviceName":"payment-api","environment":"production","thresholdCount":5,"windowSeconds":60,"cooldownSeconds":300,"enabled":true}
+```
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/pom.xml
+----------------------------------------------------------------------
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+ <modelVersion>4.0.0</modelVersion>
+ <parent><groupId>com.logplatform</groupId><artifactId>log-platform</artifactId><version>1.0.0-SNAPSHOT</version><relativePath>../pom.xml</relativePath></parent>
+ <artifactId>alert-service</artifactId>
+ <dependencies>
+  <dependency><groupId>com.logplatform</groupId><artifactId>common-core</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-validation</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+  <dependency><groupId>com.mysql</groupId><artifactId>mysql-connector-j</artifactId><scope>runtime</scope></dependency>
+  <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId></dependency>
+  <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-mysql</artifactId></dependency>
+  <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+ </dependencies>
+ <build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build>
+</project>
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/AlertServiceApplication.java
+----------------------------------------------------------------------
+package com.logplatform.alert;
+import org.springframework.boot.SpringApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
+@EnableScheduling
+@SpringBootApplication
+@ConfigurationPropertiesScan
+public class AlertServiceApplication {
+ public static void main(String[] args) { SpringApplication.run(AlertServiceApplication.class, args); }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/config/AlertProperties.java
+----------------------------------------------------------------------
+package com.logplatform.alert.config;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+@ConfigurationProperties(prefix="app.alert")
+public record AlertProperties(String processedStream, String deadLetterStream, String consumerGroup,
+ String consumerName, long pollDelayMs, String windowKeyPrefix, long cooldownSeconds, String notificationStream) { }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/domain/IncidentEntity.java
+----------------------------------------------------------------------
+package com.logplatform.alert.domain;
+import jakarta.persistence.*; import java.time.Instant;
+@Entity @Table(name="incidents")
+public class IncidentEntity {
+ @Id @GeneratedValue(strategy=GenerationType.IDENTITY) private Long id;
+ @Column(name="tenant_id",nullable=false) private Long tenantId;
+ @Column(name="rule_id",nullable=false) private Long ruleId;
+ @Column(nullable=false,length=128) private String fingerprint;
+ @Column(nullable=false,length=24) private String status;
+ @Column(nullable=false,length=255) private String title;
+ @Column(columnDefinition="TEXT") private String description;
+ @Column(name="first_seen_at",nullable=false) private Instant firstSeenAt;
+ @Column(name="last_seen_at",nullable=false) private Instant lastSeenAt;
+ @Column(name="occurrence_count",nullable=false) private long occurrenceCount=1;
+ @Column(name="acknowledged_by") private String acknowledgedBy;
+ @Column(name="assigned_to") private String assignedTo;
+ @Column(name="resolved_at") private Instant resolvedAt;
+ @Version private long version;
+ protected IncidentEntity(){}
+ public IncidentEntity(long tenantId,long ruleId,String fingerprint,String title,String description,Instant now){this.tenantId=tenantId;this.ruleId=ruleId;this.fingerprint=fingerprint;this.title=title;this.description=description;this.status="OPEN";this.firstSeenAt=now;this.lastSeenAt=now;}
+ public Long getId(){return id;} public Long getTenantId(){return tenantId;} public Long getRuleId(){return ruleId;} public String getFingerprint(){return fingerprint;} public String getStatus(){return status;} public String getTitle(){return title;} public String getDescription(){return description;} public Instant getFirstSeenAt(){return firstSeenAt;} public Instant getLastSeenAt(){return lastSeenAt;} public long getOccurrenceCount(){return occurrenceCount;} public String getAcknowledgedBy(){return acknowledgedBy;} public String getAssignedTo(){return assignedTo;} public Instant getResolvedAt(){return resolvedAt;}
+ public void touch(Instant t){lastSeenAt=t;occurrenceCount++;} public void acknowledge(String who){if(!status.equals("OPEN"))throw new IllegalStateException("Only OPEN incidents can be acknowledged");status="ACKNOWLEDGED";acknowledgedBy=who;}
+ public void assign(String who){if(status.equals("RESOLVED"))throw new IllegalStateException("Resolved incident cannot be assigned");assignedTo=who;}
+ public void resolve(Instant t){if(status.equals("RESOLVED"))return;status="RESOLVED";resolvedAt=t;}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/domain/NotificationOutboxEntity.java
+----------------------------------------------------------------------
+package com.logplatform.alert.domain;
+import jakarta.persistence.*; import java.time.Instant;
+@Entity @Table(name="notification_outbox")
+public class NotificationOutboxEntity {
+ @Id @GeneratedValue(strategy=GenerationType.IDENTITY) private Long id;
+ @Column(name="event_key",nullable=false,unique=true) private String eventKey;
+ @Column(name="tenant_id",nullable=false) private Long tenantId;
+ @Column(nullable=false,columnDefinition="json") private String payload;
+ @Column(nullable=false) private String status="PENDING";
+ @Column(nullable=false) private int attempts=0;
+ @Column(name="next_attempt_at",nullable=false) private Instant nextAttemptAt;
+ @Column(name="created_at",nullable=false) private Instant createdAt;
+ @Column(name="published_at") private Instant publishedAt;
+ @Column(name="last_error",length=1000) private String lastError;
+ protected NotificationOutboxEntity(){}
+ public NotificationOutboxEntity(String key,long tenant,String payload,Instant now){eventKey=key;tenantId=tenant;this.payload=payload;createdAt=nextAttemptAt=now;}
+ public Long getId(){return id;} public String getEventKey(){return eventKey;} public long getTenantId(){return tenantId;} public String getPayload(){return payload;} public int getAttempts(){return attempts;} public void published(Instant t){status="PUBLISHED";publishedAt=t;lastError=null;} public void failed(String e,Instant next){status="PENDING";attempts++;lastError=e==null?"unknown":e.substring(0,Math.min(1000,e.length()));nextAttemptAt=next;}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/domain/RuleEntity.java
+----------------------------------------------------------------------
+package com.logplatform.alert.domain;
+import jakarta.persistence.*; import java.time.Instant;
+@Entity @Table(name="alert_rules")
+public class RuleEntity {
+ @Id @GeneratedValue(strategy=GenerationType.IDENTITY) private Long id;
+ @Column(name="tenant_id",nullable=false) private Long tenantId;
+ @Column(nullable=false,length=150) private String name;
+ @Column(length=500) private String description;
+ @Column(length=16) private String severity;
+ @Column(name="service_name",length=150) private String serviceName;
+ @Column(length=80) private String environment;
+ @Column(name="threshold_count",nullable=false) private int thresholdCount;
+ @Column(name="window_seconds",nullable=false) private int windowSeconds;
+ @Column(name="cooldown_seconds",nullable=false) private int cooldownSeconds=300;
+ @Column(nullable=false) private boolean enabled=true;
+ @Column(name="created_at",nullable=false) private Instant createdAt;
+ @Column(name="updated_at",nullable=false) private Instant updatedAt;
+ @PrePersist void create(){createdAt=updatedAt=Instant.now();} @PreUpdate void update(){updatedAt=Instant.now();}
+ public Long getId(){return id;} public Long getTenantId(){return tenantId;} public void setTenantId(Long v){tenantId=v;}
+ public String getName(){return name;} public void setName(String v){name=v;} public String getDescription(){return description;} public void setDescription(String v){description=v;}
+ public String getSeverity(){return severity;} public void setSeverity(String v){severity=v;} public String getServiceName(){return serviceName;} public void setServiceName(String v){serviceName=v;}
+ public String getEnvironment(){return environment;} public void setEnvironment(String v){environment=v;} public int getThresholdCount(){return thresholdCount;} public void setThresholdCount(int v){thresholdCount=v;}
+ public int getWindowSeconds(){return windowSeconds;} public void setWindowSeconds(int v){windowSeconds=v;} public int getCooldownSeconds(){return cooldownSeconds;} public void setCooldownSeconds(int v){cooldownSeconds=v;}
+ public boolean isEnabled(){return enabled;} public void setEnabled(boolean v){enabled=v;}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/repository/IncidentRepository.java
+----------------------------------------------------------------------
+package com.logplatform.alert.repository;
+import com.logplatform.alert.domain.IncidentEntity; import org.springframework.data.jpa.repository.JpaRepository; import java.util.*;
+public interface IncidentRepository extends JpaRepository<IncidentEntity,Long>{ Optional<IncidentEntity> findFirstByTenantIdAndFingerprintAndStatusIn(Long tenant,String fp,Collection<String> statuses); Optional<IncidentEntity> findByIdAndTenantId(Long id,Long tenant); List<IncidentEntity> findByTenantIdOrderByLastSeenAtDesc(Long tenant); List<IncidentEntity> findByTenantIdAndStatusOrderByLastSeenAtDesc(Long tenant,String status); }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/repository/NotificationOutboxRepository.java
+----------------------------------------------------------------------
+package com.logplatform.alert.repository;
+import com.logplatform.alert.domain.NotificationOutboxEntity; import org.springframework.data.jpa.repository.JpaRepository; import org.springframework.data.jpa.repository.Query; import org.springframework.data.repository.query.Param; import java.time.Instant; import java.util.List;
+public interface NotificationOutboxRepository extends JpaRepository<NotificationOutboxEntity,Long>{ @Query(value="SELECT * FROM notification_outbox WHERE status='PENDING' AND next_attempt_at <= :now ORDER BY id LIMIT :lim",nativeQuery=true) List<NotificationOutboxEntity> due(@Param("now") Instant now,@Param("lim") int lim); }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/repository/RuleRepository.java
+----------------------------------------------------------------------
+package com.logplatform.alert.repository;
+import com.logplatform.alert.domain.RuleEntity; import org.springframework.data.jpa.repository.JpaRepository; import java.util.List; import java.util.Optional;
+public interface RuleRepository extends JpaRepository<RuleEntity,Long>{ List<RuleEntity> findByTenantIdAndEnabledTrue(Long tenantId); List<RuleEntity> findByTenantId(Long tenantId); Optional<RuleEntity> findByIdAndTenantId(Long id,Long tenantId); }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/service/AlertEvaluationService.java
+----------------------------------------------------------------------
+package com.logplatform.alert.service;
+import com.fasterxml.jackson.databind.ObjectMapper; import com.logplatform.alert.config.AlertProperties; import com.logplatform.alert.domain.*; import com.logplatform.alert.repository.*; import com.logplatform.common.ProcessedLogEvent; import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.stereotype.Service; import org.springframework.transaction.annotation.Transactional; import java.nio.charset.StandardCharsets; import java.security.MessageDigest; import java.time.Instant; import java.util.*;
+@Service public class AlertEvaluationService {
+ private final RuleRepository rules; private final IncidentRepository incidents; private final NotificationOutboxRepository outbox; private final SlidingWindowCounter counter; private final StringRedisTemplate redis; private final ObjectMapper mapper; private final AlertProperties props;
+ public AlertEvaluationService(RuleRepository r,IncidentRepository i,NotificationOutboxRepository o,SlidingWindowCounter c,StringRedisTemplate redis,ObjectMapper m,AlertProperties p){rules=r;incidents=i;outbox=o;counter=c;this.redis=redis;mapper=m;props=p;}
+ @Transactional public void evaluate(ProcessedLogEvent e){if(e==null||e.tenantId()<=0||e.eventId()==null||e.timestamp()==null||e.severity()==null)return;
+  for(RuleEntity rule:rules.findByTenantIdAndEnabledTrue(e.tenantId())){if(!matches(rule,e))continue;String fp=fingerprint(e,rule);String key=props.windowKeyPrefix()+e.tenantId()+":"+rule.getId()+":"+fp;long count=counter.addAndCount(key,e.eventId(),e.timestamp(),rule.getWindowSeconds());if(count<rule.getThresholdCount())continue;
+   Optional<IncidentEntity> active=incidents.findFirstByTenantIdAndFingerprintAndStatusIn(e.tenantId(),fp,List.of("OPEN","ACKNOWLEDGED"));
+   if(active.isPresent()){IncidentEntity incident=active.get();incident.touch(e.timestamp());continue;}
+   IncidentEntity incident=incidents.save(new IncidentEntity(e.tenantId(),rule.getId(),fp,rule.getName(),"Threshold reached: "+count+" events in "+rule.getWindowSeconds()+" seconds",e.timestamp()));
+   String eventKey="incident-created:"+incident.getTenantId()+":"+incident.getId();Map<String,Object> payload=new LinkedHashMap<>();payload.put("eventId",eventKey);payload.put("tenantId",e.tenantId());payload.put("incidentId",incident.getId());payload.put("ruleId",rule.getId());payload.put("title",incident.getTitle());payload.put("status",incident.getStatus());payload.put("occurredAt",e.timestamp().toString());try { outbox.save(new NotificationOutboxEntity(eventKey,e.tenantId(),mapper.writeValueAsString(payload),Instant.now())); } catch (com.fasterxml.jackson.core.JsonProcessingException jsonError) { throw new IllegalStateException("Could not serialize incident notification", jsonError); }
+  }
+ }
+ private boolean matches(RuleEntity r,ProcessedLogEvent e){return (r.getSeverity()==null||r.getSeverity().equalsIgnoreCase(e.severity().name()))&&(r.getServiceName()==null||r.getServiceName().equals(e.service()))&&(r.getEnvironment()==null||r.getEnvironment().equals(e.environment()));}
+ private String fingerprint(ProcessedLogEvent e,RuleEntity r){String raw=e.tenantId()+"|"+r.getId()+"|"+Objects.toString(e.service(),"")+"|"+Objects.toString(e.environment(),"")+"|"+e.severity();try{byte[] b=MessageDigest.getInstance("SHA-256").digest(raw.getBytes(StandardCharsets.UTF_8));return HexFormat.of().formatHex(b);}catch(Exception x){throw new IllegalStateException(x);}}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/service/IncidentService.java
+----------------------------------------------------------------------
+package com.logplatform.alert.service;
+import com.logplatform.alert.domain.IncidentEntity;import com.logplatform.alert.repository.IncidentRepository;import org.springframework.stereotype.Service;import org.springframework.transaction.annotation.Transactional;import java.time.Instant;import java.util.*;
+@Service public class IncidentService {private final IncidentRepository repo;public IncidentService(IncidentRepository r){repo=r;}
+ @Transactional(readOnly=true) public List<IncidentEntity> list(long tenant,String status){return status==null?repo.findByTenantIdOrderByLastSeenAtDesc(tenant):repo.findByTenantIdAndStatusOrderByLastSeenAtDesc(tenant,status.toUpperCase());}
+ @Transactional(readOnly=true) public IncidentEntity get(long tenant,long id){return repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Incident not found"));}
+ @Transactional public IncidentEntity acknowledge(long tenant,long id,String actor){IncidentEntity i=get(tenant,id);i.acknowledge(actor);return i;}
+ @Transactional public IncidentEntity assign(long tenant,long id,String assignee){IncidentEntity i=get(tenant,id);i.assign(assignee);return i;}
+ @Transactional public IncidentEntity resolve(long tenant,long id){IncidentEntity i=get(tenant,id);i.resolve(Instant.now());return i;}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/service/NotificationOutboxPublisher.java
+----------------------------------------------------------------------
+package com.logplatform.alert.service;
+import com.logplatform.alert.config.AlertProperties; import com.logplatform.alert.domain.NotificationOutboxEntity; import com.logplatform.alert.repository.NotificationOutboxRepository; import org.springframework.data.redis.connection.stream.MapRecord; import org.springframework.data.redis.connection.stream.StreamRecords; import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.scheduling.annotation.Scheduled; import org.springframework.stereotype.Component; import org.springframework.transaction.annotation.Transactional; import java.time.Instant; import java.util.*;
+@Component public class NotificationOutboxPublisher {
+ private final NotificationOutboxRepository repo; private final StringRedisTemplate redis; private final AlertProperties props;
+ public NotificationOutboxPublisher(NotificationOutboxRepository r,StringRedisTemplate redis,AlertProperties p){repo=r;this.redis=redis;props=p;}
+ @Scheduled(fixedDelayString="${ALERT_OUTBOX_POLL_MS:2000}") @Transactional public void publish(){for(NotificationOutboxEntity e:repo.due(Instant.now(),50)){try{Map<String,String> body=Map.of("eventKey",e.getEventKey(),"tenantId",String.valueOf(e.getTenantId()),"payload",e.getPayload());MapRecord<String,String,String> record=StreamRecords.newRecord().in(props.notificationStream()).ofMap(body);redis.opsForStream().add(record);e.published(Instant.now());}catch(Exception ex){long delay=Math.min(3600,1L<<Math.min(12,e.getAttempts()));e.failed(ex.getMessage(),Instant.now().plusSeconds(delay));}}}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/service/RuleService.java
+----------------------------------------------------------------------
+package com.logplatform.alert.service;
+import com.logplatform.alert.domain.RuleEntity; import com.logplatform.alert.repository.RuleRepository; import com.logplatform.alert.web.RuleRequest; import org.springframework.stereotype.Service; import org.springframework.transaction.annotation.Transactional; import java.util.*;
+@Service public class RuleService {private final RuleRepository repo;public RuleService(RuleRepository r){repo=r;}
+ @Transactional public RuleEntity create(long tenant,RuleRequest q){RuleEntity r=new RuleEntity();apply(r,q);r.setTenantId(tenant);return repo.save(r);}
+ @Transactional(readOnly=true) public List<RuleEntity> list(long tenant){return repo.findByTenantId(tenant);}
+ @Transactional public RuleEntity update(long tenant,long id,RuleRequest q){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));apply(r,q);return r;}
+ @Transactional public void delete(long tenant,long id){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));r.setEnabled(false);}
+ private void apply(RuleEntity r,RuleRequest q){if(q.severity()!=null&&!Set.of("TRACE","DEBUG","INFO","WARN","ERROR","FATAL").contains(q.severity().toUpperCase()))throw new IllegalArgumentException("Unsupported severity");r.setName(q.name());r.setDescription(q.description());r.setSeverity(q.severity()==null?null:q.severity().toUpperCase());r.setServiceName(q.serviceName());r.setEnvironment(q.environment());r.setThresholdCount(q.thresholdCount());r.setWindowSeconds(q.windowSeconds());r.setCooldownSeconds(q.cooldownSeconds());r.setEnabled(q.enabled());}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/service/SlidingWindowCounter.java
+----------------------------------------------------------------------
+package com.logplatform.alert.service;
+import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.data.redis.core.script.DefaultRedisScript; import org.springframework.stereotype.Component; import java.time.Instant; import java.util.List; import java.util.UUID;
+@Component public class SlidingWindowCounter {
+ private final StringRedisTemplate redis; private final DefaultRedisScript<Long> script;
+ public SlidingWindowCounter(StringRedisTemplate redis){this.redis=redis;this.script=new DefaultRedisScript<>();this.script.setResultType(Long.class);this.script.setScriptText("local k=KEYS[1]; local now=tonumber(ARGV[1]); local cutoff=now-tonumber(ARGV[2]); redis.call('ZREMRANGEBYSCORE',k,'-inf',cutoff); redis.call('ZADD',k,now,ARGV[3]); redis.call('PEXPIRE',k,tonumber(ARGV[2])*1000+5000); return redis.call('ZCARD',k)");}
+ public long addAndCount(String key,String eventId,Instant at,int windowSeconds){Long n=redis.execute(script,List.of(key),String.valueOf(at.toEpochMilli()),String.valueOf(windowSeconds*1000L),eventId+":"+UUID.randomUUID());return n==null?0:n;}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/stream/ProcessedLogStreamConsumer.java
+----------------------------------------------------------------------
+package com.logplatform.alert.stream;
+import com.fasterxml.jackson.databind.ObjectMapper; import com.logplatform.alert.config.AlertProperties; import com.logplatform.alert.service.AlertEvaluationService; import com.logplatform.common.ProcessedLogEvent; import org.springframework.boot.context.event.ApplicationReadyEvent; import org.springframework.context.event.EventListener; import org.springframework.data.redis.connection.stream.*; import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.scheduling.annotation.Scheduled; import org.springframework.stereotype.Component; import java.time.Duration; import java.util.*;
+@Component public class ProcessedLogStreamConsumer {
+ private final StringRedisTemplate redis; private final AlertProperties props; private final ObjectMapper mapper; private final AlertEvaluationService evaluator; private volatile boolean groupReady;
+ public ProcessedLogStreamConsumer(StringRedisTemplate r,AlertProperties p,ObjectMapper m,AlertEvaluationService e){redis=r;props=p;mapper=m;evaluator=e;}
+ @EventListener(ApplicationReadyEvent.class) public void createGroup(){try{redis.opsForStream().createGroup(props.processedStream(),ReadOffset.from("0-0"),props.consumerGroup());}catch(Exception ex){if(ex.getMessage()==null||!ex.getMessage().contains("BUSYGROUP"))throw ex;}groupReady=true;}
+ @Scheduled(fixedDelayString="${app.alert.poll-delay-ms:1000}") public void poll(){if(!groupReady)return;List<MapRecord<String,Object,Object>> records=redis.opsForStream().read(Consumer.from(props.consumerGroup(),props.consumerName()),StreamReadOptions.empty().count(20).block(Duration.ofMillis(500)),StreamOffset.create(props.processedStream(),ReadOffset.lastConsumed()));if(records==null)return;for(var rec:records)process(rec);}
+ private void process(MapRecord<String,Object,Object> rec){try{Map<String,Object> m=new HashMap<>();rec.getValue().forEach((k,v)->m.put(String.valueOf(k),v));ProcessedLogEvent event=mapper.convertValue(m,ProcessedLogEvent.class);evaluator.evaluate(event);redis.opsForStream().acknowledge(props.processedStream(),props.consumerGroup(),rec.getId());}catch(Exception ex){try{Map<String,String> dlq=new LinkedHashMap<>();dlq.put("sourceStream",props.processedStream());dlq.put("sourceId",rec.getId().getValue());dlq.put("error",String.valueOf(ex.getMessage()));rec.getValue().forEach((k,v)->dlq.put(String.valueOf(k),String.valueOf(v)));redis.opsForStream().add(StreamRecords.newRecord().in(props.deadLetterStream()).ofMap(dlq));redis.opsForStream().acknowledge(props.processedStream(),props.consumerGroup(),rec.getId());}catch(Exception ignored){/* leave pending for redelivery */}}}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/ActionRequest.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import jakarta.validation.constraints.NotBlank; import jakarta.validation.constraints.Size;
+public record ActionRequest(@NotBlank @Size(max=150) String value){}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import com.logplatform.alert.service.RuleService;import jakarta.validation.Valid;import org.springframework.http.HttpStatus;import org.springframework.web.bind.annotation.*;import java.util.*;
+@RestController @RequestMapping("/api/v1/alert-rules") public class AlertRuleController {private final RuleService service;public AlertRuleController(RuleService s){service=s;}
+ private long tenant(String h){try{return Long.parseLong(h);}catch(Exception e){throw new IllegalArgumentException("Missing or invalid trusted X-Tenant-Id");}}
+ @PostMapping @ResponseStatus(HttpStatus.CREATED) public RuleResponse create(@RequestHeader("X-Tenant-Id") String t,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.create(tenant(t),q));}
+ @GetMapping public List<RuleResponse> list(@RequestHeader("X-Tenant-Id") String t){return service.list(tenant(t)).stream().map(RuleResponse::from).toList();}
+ @PutMapping("/{id}") public RuleResponse update(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.update(tenant(t),id,q));}
+ @DeleteMapping("/{id}") @ResponseStatus(HttpStatus.NO_CONTENT) public void delete(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){service.delete(tenant(t),id);}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/ApiExceptionHandler.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import org.springframework.http.*;import org.springframework.web.bind.MethodArgumentNotValidException;import org.springframework.web.bind.annotation.*;import java.util.*;
+@RestControllerAdvice public class ApiExceptionHandler {
+ @ExceptionHandler(NoSuchElementException.class) @ResponseStatus(HttpStatus.NOT_FOUND) public Map<String,Object> notFound(Exception e){return Map.of("status",404,"error","NOT_FOUND","message",e.getMessage());}
+ @ExceptionHandler({IllegalArgumentException.class,IllegalStateException.class}) @ResponseStatus(HttpStatus.BAD_REQUEST) public Map<String,Object> bad(Exception e){return Map.of("status",400,"error","BAD_REQUEST","message",e.getMessage()==null?"Invalid request":e.getMessage());}
+ @ExceptionHandler(MethodArgumentNotValidException.class) @ResponseStatus(HttpStatus.BAD_REQUEST) public Map<String,Object> validation(MethodArgumentNotValidException e){return Map.of("status",400,"error","VALIDATION_ERROR","message","Request validation failed");}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import com.logplatform.alert.service.IncidentService;import jakarta.validation.Valid;import org.springframework.web.bind.annotation.*;import java.util.*;
+@RestController @RequestMapping("/api/v1/incidents") public class IncidentController {private final IncidentService service;public IncidentController(IncidentService s){service=s;}
+ private long tenant(String h){try{return Long.parseLong(h);}catch(Exception e){throw new IllegalArgumentException("Missing or invalid trusted X-Tenant-Id");}}
+ @GetMapping public List<IncidentResponse> list(@RequestHeader("X-Tenant-Id") String t,@RequestParam(required=false) String status){return service.list(tenant(t),status).stream().map(IncidentResponse::from).toList();}
+ @GetMapping("/{id}") public IncidentResponse get(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){return IncidentResponse.from(service.get(tenant(t),id));}
+ @PostMapping("/{id}/acknowledge") public IncidentResponse acknowledge(@RequestHeader("X-Tenant-Id") String t,@RequestHeader(value="X-User-Id",defaultValue="system") String actor,@PathVariable long id){return IncidentResponse.from(service.acknowledge(tenant(t),id,actor));}
+ @PostMapping("/{id}/assign") public IncidentResponse assign(@RequestHeader("X-Tenant-Id") String t,@Valid @RequestBody ActionRequest q,@PathVariable long id){return IncidentResponse.from(service.assign(tenant(t),id,q.value()));}
+ @PostMapping("/{id}/resolve") public IncidentResponse resolve(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){return IncidentResponse.from(service.resolve(tenant(t),id));}
+}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/IncidentResponse.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import com.logplatform.alert.domain.IncidentEntity; import java.time.Instant;
+public record IncidentResponse(Long id,Long tenantId,Long ruleId,String fingerprint,String status,String title,String description,Instant firstSeenAt,Instant lastSeenAt,long occurrenceCount,String acknowledgedBy,String assignedTo,Instant resolvedAt){public static IncidentResponse from(IncidentEntity i){return new IncidentResponse(i.getId(),i.getTenantId(),i.getRuleId(),i.getFingerprint(),i.getStatus(),i.getTitle(),i.getDescription(),i.getFirstSeenAt(),i.getLastSeenAt(),i.getOccurrenceCount(),i.getAcknowledgedBy(),i.getAssignedTo(),i.getResolvedAt());}}
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/RuleRequest.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import jakarta.validation.constraints.*;
+public record RuleRequest(@NotBlank @Size(max=150) String name,@Size(max=500) String description,String severity,String serviceName,String environment,@Min(1) @Max(100000) int thresholdCount,@Min(1) @Max(86400) int windowSeconds,@Min(0) @Max(86400) int cooldownSeconds,boolean enabled) { }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/java/com/logplatform/alert/web/RuleResponse.java
+----------------------------------------------------------------------
+package com.logplatform.alert.web;
+import com.logplatform.alert.domain.RuleEntity;
+public record RuleResponse(Long id,Long tenantId,String name,String description,String severity,String serviceName,String environment,int thresholdCount,int windowSeconds,int cooldownSeconds,boolean enabled){ public static RuleResponse from(RuleEntity r){return new RuleResponse(r.getId(),r.getTenantId(),r.getName(),r.getDescription(),r.getSeverity(),r.getServiceName(),r.getEnvironment(),r.getThresholdCount(),r.getWindowSeconds(),r.getCooldownSeconds(),r.isEnabled());} }
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/resources/application.yml
+----------------------------------------------------------------------
+server:
+  port: ${ALERT_SERVER_PORT:8086}
+spring:
+  application:
+    name: alert-service
+  datasource:
+    url: ${ALERT_DB_URL:jdbc:mysql://mysql:3306/alert_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    username: ${ALERT_DB_USERNAME:alert_svc}
+    password: ${ALERT_DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+app:
+  alert:
+    processed-stream: ${LOGS_PROCESSED_STREAM:logs.processed}
+    dead-letter-stream: ${LOGS_DLQ_STREAM:logs.dlq}
+    consumer-group: ${ALERT_CONSUMER_GROUP:alert-service}
+    consumer-name: ${ALERT_CONSUMER_NAME:alert-1}
+    poll-delay-ms: ${ALERT_POLL_DELAY_MS:1000}
+    window-key-prefix: alert:window:
+    cooldown-seconds: ${ALERT_COOLDOWN_SECONDS:300}
+    notification-stream: ${NOTIFICATIONS_OUT_STREAM:notifications.out}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+
+
+----------------------------------------------------------------------
+FILE: alert-service/src/main/resources/db/migration/V1__create_alert_tables.sql
+----------------------------------------------------------------------
+CREATE TABLE alert_rules (
+ id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ tenant_id BIGINT NOT NULL,
+ name VARCHAR(150) NOT NULL,
+ description VARCHAR(500),
+ severity VARCHAR(16),
+ service_name VARCHAR(150),
+ environment VARCHAR(80),
+ threshold_count INT NOT NULL,
+ window_seconds INT NOT NULL,
+ cooldown_seconds INT NOT NULL DEFAULT 300,
+ enabled BOOLEAN NOT NULL DEFAULT TRUE,
+ created_at TIMESTAMP(6) NOT NULL,
+ updated_at TIMESTAMP(6) NOT NULL,
+ INDEX idx_rule_tenant_enabled (tenant_id, enabled),
+ CONSTRAINT chk_rule_threshold CHECK (threshold_count > 0),
+ CONSTRAINT chk_rule_window CHECK (window_seconds BETWEEN 1 AND 86400)
+) ENGINE=InnoDB;
+
+CREATE TABLE incidents (
+ id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ tenant_id BIGINT NOT NULL,
+ rule_id BIGINT NOT NULL,
+ fingerprint VARCHAR(128) NOT NULL,
+ status VARCHAR(24) NOT NULL,
+ title VARCHAR(255) NOT NULL,
+ description TEXT,
+ first_seen_at TIMESTAMP(6) NOT NULL,
+ last_seen_at TIMESTAMP(6) NOT NULL,
+ occurrence_count BIGINT NOT NULL DEFAULT 1,
+ acknowledged_by VARCHAR(150),
+ assigned_to VARCHAR(150),
+ resolved_at TIMESTAMP(6),
+ version BIGINT NOT NULL DEFAULT 0,
+ CONSTRAINT fk_incident_rule FOREIGN KEY (rule_id) REFERENCES alert_rules(id),
+ INDEX idx_incident_tenant_status (tenant_id, status, last_seen_at),
+ INDEX idx_incident_tenant_rule (tenant_id, rule_id),
+ UNIQUE KEY uk_incident_active_fingerprint (tenant_id, fingerprint, status)
+) ENGINE=InnoDB;
+
+CREATE TABLE notification_outbox (
+ id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+ event_key VARCHAR(220) NOT NULL,
+ tenant_id BIGINT NOT NULL,
+ payload JSON NOT NULL,
+ status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+ attempts INT NOT NULL DEFAULT 0,
+ next_attempt_at TIMESTAMP(6) NOT NULL,
+ created_at TIMESTAMP(6) NOT NULL,
+ published_at TIMESTAMP(6),
+ last_error VARCHAR(1000),
+ UNIQUE KEY uk_notification_outbox_event (event_key),
+ INDEX idx_notification_outbox_pending (status, next_attempt_at, id)
+) ENGINE=InnoDB;
+
+
+
+======================================================================
+TARGET: pom.xml
+======================================================================
+
+
+----------------------------------------------------------------------
+FILE: pom.xml
+----------------------------------------------------------------------
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.3.4</version><relativePath/></parent>
+  <groupId>com.logplatform</groupId><artifactId>log-platform</artifactId><version>1.0.0-SNAPSHOT</version><packaging>pom</packaging>
+  <name>log-platform</name>
+  <properties>
+    <java.version>21</java.version>
+    <testcontainers.version>1.20.6</testcontainers.version>
+    <spring-cloud.version>2023.0.3</spring-cloud.version>
+    <mapstruct.version>1.5.5.Final</mapstruct.version>
+    <springdoc.version>2.6.0</springdoc.version>
+    <jjwt.version>0.12.6</jjwt.version>
+    <!-- Newer Flyway for reliable MySQL 8.4 support -->
+    <flyway.version>10.17.3</flyway.version>
+  </properties>
+  <!-- Modules are added phase by phase. -->
+  <modules>
+    <module>common-core</module>
+    <module>common-web</module>
+    <module>identity-service</module>
+    <module>api-gateway</module>
+    <module>ingestion-service</module>  
+    <module>processing-service</module>
+    <module>query-service</module>
+    <module>alert-service</module>
+</modules>
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-dependencies</artifactId><version>${spring-cloud.version}</version><type>pom</type><scope>import</scope></dependency>
+      <dependency><groupId>com.logplatform</groupId><artifactId>common-core</artifactId><version>${project.version}</version></dependency>
+      <dependency><groupId>com.logplatform</groupId><artifactId>common-web</artifactId><version>${project.version}</version></dependency>
+      <dependency><groupId>org.mapstruct</groupId><artifactId>mapstruct</artifactId><version>${mapstruct.version}</version></dependency>
+      <dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-starter-webmvc-ui</artifactId><version>${springdoc.version}</version></dependency>
+      <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-api</artifactId><version>${jjwt.version}</version></dependency>
+      <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-impl</artifactId><version>${jjwt.version}</version></dependency>
+      <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-jackson</artifactId><version>${jjwt.version}</version></dependency>
+    </dependencies>
+  </dependencyManagement>
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId>
+          <configuration>
+            <annotationProcessorPaths>
+              <path><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><version>${lombok.version}</version></path>
+              <path><groupId>org.projectlombok</groupId><artifactId>lombok-mapstruct-binding</artifactId><version>0.2.0</version></path>
+              <path><groupId>org.mapstruct</groupId><artifactId>mapstruct-processor</artifactId><version>${mapstruct.version}</version></path>
+            </annotationProcessorPaths>
+            <compilerArgs><arg>-Amapstruct.defaultComponentModel=spring</arg></compilerArgs>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>
+
+
+
+======================================================================
+TARGET: docker-compose.yml
+======================================================================
+
+
+----------------------------------------------------------------------
+FILE: docker-compose.yml
+----------------------------------------------------------------------
+name: logplatform
+
+# Phase 0: infrastructure + application services
+services:
+  mysql:
+    image: mysql:8.4
+    mem_limit: 640m
+    command:
+      - "--innodb-buffer-pool-size=256M"
+      - "--performance_schema=OFF"
+      - "--max-connections=100"
+      - "--character-set-server=utf8mb4"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?copy .env.example to .env}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      PROCESSING_DB_PASSWORD: ${PROCESSING_DB_PASSWORD:?}
+      QUERY_DB_PASSWORD: ${QUERY_DB_PASSWORD:?}
+      ALERT_DB_PASSWORD: ${ALERT_DB_PASSWORD:?}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?}
+    ports:
+      - "127.0.0.1:3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7.2-alpine
+    mem_limit: 192m
+    # Streams must not be silently evicted.
+    command:
+      - redis-server
+      - "--maxmemory"
+      - "128mb"
+      - "--maxmemory-policy"
+      - "noeviction"
+      - "--appendonly"
+      - "yes"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?}"
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?}"
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG'
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  identity-service:
+    profiles: ["core"]
+    build:
+      context: .
+      args:
+        JAR: identity-service/target/identity-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      DB_URL: jdbc:mysql://mysql:3306/identity_db
+      DB_USERNAME: identity_svc
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?}
+      INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:?}
+      IDENTITY_JWT_PRIVATE_KEY_PATH: /keys/private.pem
+      IDENTITY_JWT_PUBLIC_KEY_PATH: /keys/public.pem
+    volumes:
+      - "./secrets:/keys:ro"
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+        
+   alert-service:
+    profiles: ["alerting"]
+    build:
+      context: .
+      dockerfile: alert-service/Dockerfile
+      args:
+        JAR: alert-service/target/alert-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      ALERT_DB_URL: jdbc:mysql://mysql:3306/alert_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      ALERT_DB_USERNAME: alert_svc
+      ALERT_DB_PASSWORD: ${ALERT_DB_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    ports:
+      - "127.0.0.1:8086:8086"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  processing-service:
+    profiles: ["processing"]
+    build:
+      context: .
+      dockerfile: processing-service/Dockerfile
+      args:
+        JAR: processing-service/target/processing-service-1.0.0-SNAPSHOT.jar
+    mem_limit: 384m
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m -XX:+UseSerialGC"
+      PROCESSING_DB_URL: jdbc:mysql://mysql:3306/logs_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      PROCESSING_DB_USERNAME: processing_svc
+      PROCESSING_DB_PASSWORD: ${PROCESSING_DB_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+      PROCESSING_CONSUMER_NAME: ${PROCESSING_CONSUMER_NAME:-processing-1}
+    ports:
+      - "127.0.0.1:8084:8084"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+
+
+
+======================================================================
+TARGET: docker
+======================================================================
+
+
+----------------------------------------------------------------------
+FILE: docker/mysql-init/01-schemas.sh
+----------------------------------------------------------------------
+#!/bin/bash
+# Runs once on first start of an empty MySQL volume. One schema and one user per service (database ownership).
+set -e
+mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<SQL
+CREATE DATABASE IF NOT EXISTS identity_db     CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS logs_db         CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS alert_db        CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS notification_db CHARACTER SET utf8mb4;
+
+CREATE USER IF NOT EXISTS 'identity_svc'@'%'     IDENTIFIED BY '${IDENTITY_DB_PASSWORD}';
+CREATE USER IF NOT EXISTS 'processing_svc'@'%'   IDENTIFIED BY '${PROCESSING_DB_PASSWORD}';
+CREATE USER IF NOT EXISTS 'query_svc'@'%'        IDENTIFIED BY '${QUERY_DB_PASSWORD}';
+CREATE USER IF NOT EXISTS 'alert_svc'@'%'        IDENTIFIED BY '${ALERT_DB_PASSWORD}';
+CREATE USER IF NOT EXISTS 'notification_svc'@'%' IDENTIFIED BY '${NOTIFICATION_DB_PASSWORD}';
+
+GRANT ALL ON identity_db.*     TO 'identity_svc'@'%';
+GRANT ALL ON logs_db.*         TO 'processing_svc'@'%';   -- sole writer of logs_db (also runs its Flyway migrations)
+GRANT SELECT ON logs_db.*      TO 'query_svc'@'%';        -- query-service is read-only
+GRANT ALL ON alert_db.*        TO 'alert_svc'@'%';
+GRANT ALL ON notification_db.* TO 'notification_svc'@'%';
+FLUSH PRIVILEGES;
+SQL
+
+
+
+======================================================================
+TARGET: common-core
+======================================================================
+
+[SKIPPED SENSITIVE FILE] common-core/.env
+
+
+----------------------------------------------------------------------
+FILE: common-core/pom.xml
+----------------------------------------------------------------------
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.logplatform</groupId>
+        <artifactId>log-platform</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+    <artifactId>common-core</artifactId>
+    <description>Pure Java contracts shared by every service (no Spring dependency): events, stream names, headers,
+        roles.
+    </description>
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/ApiException.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+/**
+ * Business exception carrying an HTTP status and a stable machine-readable code. Mapped to JSON by common-web.
+ */
+public class ApiException extends RuntimeException {
+    private final int status;
+    private final String code;
+
+    public ApiException(int status, String code, String message) {
+        super(message);
+        this.status = status;
+        this.code = code;
+    }
+
+    public int getStatus() {
+        return status;
+    }
+
+    public String getCode() {
+        return code;
+    }
+
+    public static ApiException badRequest(String code, String msg) {
+        return new ApiException(400, code, msg);
+    }
+
+    public static ApiException unauthorized(String msg) {
+        return new ApiException(401, "UNAUTHORIZED", msg);
+    }
+
+    public static ApiException forbidden(String msg) {
+        return new ApiException(403, "FORBIDDEN", msg);
+    }
+
+    public static ApiException notFound(String msg) {
+        return new ApiException(404, "NOT_FOUND", msg);
+    }
+
+    public static ApiException conflict(String code, String msg) {
+        return new ApiException(409, code, msg);
+    }
+
+    public static ApiException tooManyRequests(String msg) {
+        return new ApiException(429, "RATE_LIMITED", msg);
+    }
+
+    public static ApiException unavailable(String msg) {
+        return new ApiException(503, "UNAVAILABLE", msg);
+    }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/Hashing.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+
+public final class Hashing {
+    private Hashing() {
+    }
+
+    public static String sha256Hex(String s) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/Headers.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+/**
+ * HTTP header names used between client, gateway and services.
+ */
+public final class Headers {
+    private Headers() {
+    }
+
+    public static final String X_API_KEY = "X-API-KEY";
+    public static final String X_CORRELATION_ID = "X-Correlation-Id";
+    /**
+     * Set by the gateway only. Any client-supplied value must be stripped.
+     */
+    public static final String X_TENANT_ID = "X-Tenant-Id";
+    public static final String X_USER_ID = "X-User-Id";
+    public static final String X_USER_ROLE = "X-User-Role";
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/ProcessedLogEvent.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+import java.time.Instant;
+
+/**
+ * Message on stream {@code logs.processed}. Written by processing-service after the log row is committed.
+ */
+public record ProcessedLogEvent(
+        String eventId,
+        long tenantId,
+        Instant timestamp,
+        String service,
+        String environment,
+        Severity severity,
+        String message,
+        String traceId,
+        String fingerprint) {
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/RawLogEvent.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+import java.time.Instant;
+import java.util.Map;
+
+/**
+ * Message on stream {@code logs.raw}. Written by ingestion-service after validation; tenantId comes from the API key, never from the client.
+ */
+public record RawLogEvent(
+        String eventId,
+        long tenantId,
+        Instant receivedAt,
+        String service,
+        String environment,
+        String severity,
+        String message,
+        Instant timestamp,
+        String traceId,
+        String spanId,
+        Map<String, String> attributes) {
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/Role.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+/**
+ * Ordered by privilege: VIEWER (read) < DEVELOPER (manage rules/incidents) < ADMIN (users, keys, tenant settings).
+ */
+public enum Role {
+    VIEWER, DEVELOPER, ADMIN;
+
+    public boolean atLeast(Role required) {
+        return this.ordinal() >= required.ordinal();
+    }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/Severity.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+import java.util.Locale;
+import java.util.Optional;
+
+/**
+ * Normalized log severity. {@link #parse(String)} maps common aliases from different logging frameworks.
+ */
+public enum Severity {
+    TRACE, DEBUG, INFO, WARN, ERROR, FATAL;
+
+    public boolean atLeast(Severity other) {
+        return this.ordinal() >= other.ordinal();
+    }
+
+    public static Optional<Severity> parse(String raw) {
+        if (raw == null) return Optional.empty();
+        Severity s = switch (raw.trim().toUpperCase(Locale.ROOT)) {
+            case "TRACE", "FINEST" -> TRACE;
+            case "DEBUG", "FINE" -> DEBUG;
+            case "INFO", "INFORMATION", "NOTICE" -> INFO;
+            case "WARN", "WARNING" -> WARN;
+            case "ERROR", "ERR", "SEVERE" -> ERROR;
+            case "FATAL", "CRITICAL", "PANIC" -> FATAL;
+            default -> null;
+        };
+        return Optional.ofNullable(s);
+    }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/main/java/com/logplatform/common/Streams.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+/**
+ * Redis Stream names and consumer groups. Single source of truth for all services.
+ */
+public final class Streams {
+    private Streams() {
+    }
+
+    public static final String LOGS_RAW = "logs.raw";
+    public static final String LOGS_PROCESSED = "logs.processed";
+    public static final String LOGS_DLQ = "logs.dlq";
+    public static final String NOTIFICATIONS_OUT = "notifications.out";
+    public static final String GROUP_PROCESSING = "processing-service";
+    public static final String GROUP_ALERTING = "alert-service";
+    public static final String GROUP_NOTIFICATION = "notification-service";
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-core/src/test/java/com/logplatform/common/CommonCoreTest.java
+----------------------------------------------------------------------
+package com.logplatform.common;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import org.junit.jupiter.api.Test;
+
+class CommonCoreTest {
+    @Test
+    void severityAliasesAreNormalized() {
+        assertEquals(Severity.WARN, Severity.parse("warning").orElseThrow());
+        assertEquals(Severity.ERROR, Severity.parse(" SEVERE ").orElseThrow());
+        assertEquals(Severity.FATAL, Severity.parse("critical").orElseThrow());
+        assertTrue(Severity.parse("banana").isEmpty());
+        assertTrue(Severity.parse(null).isEmpty());
+    }
+
+    @Test
+    void severityOrdering() {
+        assertTrue(Severity.ERROR.atLeast(Severity.WARN));
+        assertFalse(Severity.INFO.atLeast(Severity.ERROR));
+    }
+
+    @Test
+    void roleOrdering() {
+        assertTrue(Role.ADMIN.atLeast(Role.DEVELOPER));
+        assertFalse(Role.VIEWER.atLeast(Role.DEVELOPER));
+    }
+
+    @Test
+    void sha256MatchesKnownVector() {
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", Hashing.sha256Hex("abc"));
+    }
+
+    @Test
+    void apiExceptionCarriesStatusAndCode() {
+        ApiException e = ApiException.conflict("DUPLICATE", "exists");
+        assertEquals(409, e.getStatus());
+        assertEquals("DUPLICATE", e.getCode());
+    }
+}
+
+
+
+======================================================================
+TARGET: common-web
+======================================================================
+
+
+----------------------------------------------------------------------
+FILE: common-web/pom.xml
+----------------------------------------------------------------------
+<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>
+  <parent><groupId>com.logplatform</groupId><artifactId>log-platform</artifactId><version>1.0.0-SNAPSHOT</version></parent>
+  <artifactId>common-web</artifactId>
+  <description>Servlet-service auto-configuration: error format, exception handler, correlation id. Not used by the reactive gateway.</description>
+  <dependencies>
+    <dependency><groupId>com.logplatform</groupId><artifactId>common-core</artifactId><version>1.0.0-SNAPSHOT</version></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-validation</artifactId></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+      <dependency><groupId>org.springframework.security</groupId><artifactId>spring-security-core</artifactId><optional>true</optional></dependency>
+
+  </dependencies>
+
+</project>
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/ApiError.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import java.time.Instant;
+import java.util.Map;
+/** The single error body returned by every service. */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public record ApiError(Instant timestamp, int status, String code, String message, String correlationId, Map<String, String> fieldErrors) {}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/CorrelationIdFilter.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+import com.logplatform.common.Headers;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.util.UUID;
+import org.slf4j.MDC;
+import org.springframework.web.filter.OncePerRequestFilter;
+/** Reads X-Correlation-Id (set by the gateway) or creates one, and exposes it to logs via MDC key "correlationId". */
+public class CorrelationIdFilter extends OncePerRequestFilter {
+  public static final String MDC_KEY = "correlationId";
+  @Override
+  protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain) throws ServletException, IOException {
+    String id = req.getHeader(Headers.X_CORRELATION_ID);
+    if (id == null || id.isBlank()) id = UUID.randomUUID().toString();
+    MDC.put(MDC_KEY, id);
+    res.setHeader(Headers.X_CORRELATION_ID, id);
+    try { chain.doFilter(req, res); } finally { MDC.remove(MDC_KEY); }
+  }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/GlobalExceptionHandler.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+import com.logplatform.common.ApiException;
+import jakarta.validation.ConstraintViolationException;
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.ErrorResponse;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.ServletRequestBindingException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+  private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+  @ExceptionHandler(ApiException.class)
+  public ResponseEntity<ApiError> api(ApiException e) { return build(e.getStatus(), e.getCode(), e.getMessage(), null); }
+
+  @ExceptionHandler(MethodArgumentNotValidException.class)
+  public ResponseEntity<ApiError> invalid(MethodArgumentNotValidException e) {
+    Map<String, String> fields = new LinkedHashMap<>();
+    e.getBindingResult().getFieldErrors().forEach(f -> fields.putIfAbsent(f.getField(), f.getDefaultMessage()));
+    return build(400, "VALIDATION_FAILED", "Request validation failed", fields);
+  }
+
+  @ExceptionHandler(ConstraintViolationException.class)
+  public ResponseEntity<ApiError> constraint(ConstraintViolationException e) {
+    Map<String, String> fields = new LinkedHashMap<>();
+    e.getConstraintViolations().forEach(v -> fields.putIfAbsent(v.getPropertyPath().toString(), v.getMessage()));
+    return build(400, "VALIDATION_FAILED", "Request validation failed", fields);
+  }
+
+  @ExceptionHandler(HttpMessageNotReadableException.class)
+  public ResponseEntity<ApiError> unreadable(HttpMessageNotReadableException e) {
+    Throwable cause = e;
+    while (cause != null) {
+      if (cause instanceof com.fasterxml.jackson.core.JsonProcessingException) {
+        return build(400, "MALFORMED_JSON", "Request body contains invalid JSON", null);
+      }
+      cause = cause.getCause();
+    }
+    return build(400, "BAD_REQUEST", "Malformed request", null);
+  }
+
+  @ExceptionHandler({ServletRequestBindingException.class, MethodArgumentTypeMismatchException.class})
+  public ResponseEntity<ApiError> badRequest(Exception e) {
+    return build(400, "BAD_REQUEST", "Malformed request", null);
+  }
+
+  @ExceptionHandler(Exception.class)
+  public ResponseEntity<ApiError> other(Exception e) {
+    if (e instanceof ErrorResponse er) { // framework exceptions that already know their status (404, 405, 415 ...)
+      HttpStatus s = HttpStatus.valueOf(er.getStatusCode().value());
+      return build(s.value(), s.name(), s.getReasonPhrase(), null);
+    }
+    log.error("Unhandled exception", e);
+    return build(500, "INTERNAL_ERROR", "Unexpected error", null);
+  }
+
+  private ResponseEntity<ApiError> build(int status, String code, String message, Map<String, String> fields) {
+    return ResponseEntity.status(status).body(new ApiError(Instant.now(), status, code, message, MDC.get(CorrelationIdFilter.MDC_KEY), fields));
+  }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/RequestSizeLimitFilter.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.time.Instant;
+import org.slf4j.MDC;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+public class RequestSizeLimitFilter extends OncePerRequestFilter {
+    private final long maxBytes;
+    private final ObjectMapper objectMapper;
+
+    public RequestSizeLimitFilter(long maxBytes, ObjectMapper objectMapper) {
+        this.maxBytes = maxBytes;
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+        if (request.getContentLengthLong() > maxBytes) {
+            response.setStatus(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
+            response.setContentType("application/json");
+            ApiError error = new ApiError(
+                Instant.now(), 413, "PAYLOAD_TOO_LARGE",
+                "Request body exceeds the configured size limit",
+                MDC.get(CorrelationIdFilter.MDC_KEY), null
+            );
+            objectMapper.writeValue(response.getOutputStream(), error);
+            return;
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/SecurityErrorAdvice.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+import java.time.Instant;
+import org.slf4j.MDC;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+/** Without this, the catch-all handler would turn @PreAuthorize denials into 500s. */
+@RestControllerAdvice
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class SecurityErrorAdvice {
+  @ExceptionHandler(AccessDeniedException.class)
+  public ResponseEntity<ApiError> denied(AccessDeniedException e) {
+    return ResponseEntity.status(403).body(new ApiError(Instant.now(), 403, "FORBIDDEN", "You do not have permission to perform this action", MDC.get(CorrelationIdFilter.MDC_KEY), null));
+  }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/java/com/logplatform/web/WebCommonAutoConfiguration.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+
+@AutoConfiguration
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+public class WebCommonAutoConfiguration {
+  @Bean
+  @ConditionalOnMissingBean
+  GlobalExceptionHandler globalExceptionHandler() {
+    return new GlobalExceptionHandler();
+  }
+
+  @Bean
+  FilterRegistrationBean<CorrelationIdFilter> correlationIdFilter() {
+    FilterRegistrationBean<CorrelationIdFilter> r = new FilterRegistrationBean<>(new CorrelationIdFilter());
+    r.setOrder(Ordered.HIGHEST_PRECEDENCE);
+    return r;
+  }
+
+  @Bean
+  FilterRegistrationBean<RequestSizeLimitFilter> requestSizeLimitFilter(
+      ObjectMapper objectMapper,
+      @Value("${platform.web.max-request-bytes:5242880}") long maxBytes) {
+    FilterRegistrationBean<RequestSizeLimitFilter> r =
+        new FilterRegistrationBean<>(new RequestSizeLimitFilter(maxBytes, objectMapper));
+    r.setOrder(Ordered.HIGHEST_PRECEDENCE + 1);
+    return r;
+  }
+
+  @Configuration(proxyBeanMethods = false)
+  @ConditionalOnClass(name = "org.springframework.security.access.AccessDeniedException")
+  static class SecurityAdviceConfiguration {
+    @Bean
+    SecurityErrorAdvice securityErrorAdvice() {
+      return new SecurityErrorAdvice();
+    }
+  }
+}
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+----------------------------------------------------------------------
+com.logplatform.web.WebCommonAutoConfiguration
+
+
+
+----------------------------------------------------------------------
+FILE: common-web/src/test/java/com/logplatform/web/GlobalExceptionHandlerTest.java
+----------------------------------------------------------------------
+package com.logplatform.web;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import com.logplatform.common.ApiException;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.bind.annotation.*;
+class GlobalExceptionHandlerTest {
+  record Body(@NotBlank String name) {}
+  @RestController static class TestController {
+    @GetMapping("/missing") String missing() { throw ApiException.notFound("nothing here"); }
+    @PostMapping("/valid") String valid(@Valid @RequestBody Body b) { return "ok"; }
+    @GetMapping("/boom") String boom() { throw new IllegalStateException("secret internals"); }
+  }
+  MockMvc mvc;
+  @BeforeEach void setup() {
+    mvc = MockMvcBuilders.standaloneSetup(new TestController()).setControllerAdvice(new GlobalExceptionHandler()).build();
+  }
+  @Test void apiExceptionBecomesJsonWithCode() throws Exception {
+    mvc.perform(get("/missing")).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("NOT_FOUND"));
+  }
+  @Test void validationErrorListsFields() throws Exception {
+    mvc.perform(post("/valid").contentType(MediaType.APPLICATION_JSON).content("{\"name\":\"\"}"))
+        .andExpect(status().isBadRequest()).andExpect(jsonPath("$.fieldErrors.name").exists());
+  }
+  @Test void unexpectedErrorDoesNotLeakDetails() throws Exception {
+    mvc.perform(get("/boom")).andExpect(status().isInternalServerError()).andExpect(jsonPath("$.message").value("Unexpected error"));
+  }
+}
+

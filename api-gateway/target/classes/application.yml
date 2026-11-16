@@ -1,0 +1,70 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 2000
+        response-timeout: 10s
+      routes:
+        # Public: login only. Strict per-IP limit (brute-force protection until lockout exists).
+        - id: identity-login
+          uri: ${IDENTITY_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/auth/login
+            - Method=POST
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@ipKeyResolver}"
+                redis-rate-limiter.replenishRate: 2
+                redis-rate-limiter.burstCapacity: 10
+                redis-rate-limiter.requestedTokens: 1
+
+        # Authenticated identity APIs. Per-user limit.
+        - id: identity-api
+          uri: ${IDENTITY_URL:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/tenants/**,/api/v1/users/**,/api/v1/api-keys/**,/api/v1/audit-logs/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userOrIpKeyResolver}"
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 40
+                redis-rate-limiter.requestedTokens: 1
+
+        # Phase 3: Log ingestion (API-key authentication)
+        - id: ingestion-api
+          uri: ${INGESTION_URL:http://localhost:8083}
+          predicates:
+            - Path=/api/v1/logs/**
+
+        # There is deliberately NO route for /internal/** - it must never be reachable from outside.
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+gateway:
+  jwt:
+    issuer: ${JWT_ISSUER:http://localhost:8081}      # must equal identity.jwt.issuer exactly
+    jwks-uri: ${JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+
+logging:
+  level:
+    org.springframework.cloud.gateway: INFO
+    org.springframework.security: INFO
