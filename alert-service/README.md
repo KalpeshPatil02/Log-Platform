@@ -54,3 +54,14 @@ Example rule:
 ```json
 {"name":"Payment API errors","description":"5 errors in 60 seconds","severity":"ERROR","serviceName":"payment-api","environment":"production","thresholdCount":5,"windowSeconds":60,"cooldownSeconds":300,"enabled":true}
 ```
+
+
+## Roles
+
+The gateway copies the JWT `roles` claim into `X-User-Roles`; alert-service enforces it (no recognised role = 403).
+
+| Action | PLATFORM_ADMIN | TENANT_ADMIN | DEVELOPER | VIEWER |
+|---|---|---|---|---|
+| List/get rules and incidents | yes | yes | yes | yes |
+| Create/update/delete rules | no | yes | yes | no |
+| Acknowledge/assign/resolve incidents | no | yes | yes | no |
