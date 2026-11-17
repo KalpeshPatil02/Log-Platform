@@ -30,6 +30,9 @@ app:
     window-key-prefix: "alert:window:"
     cooldown-seconds: ${ALERT_COOLDOWN_SECONDS:300}
     notification-stream: ${NOTIFICATIONS_OUT_STREAM:notifications.out}
+    pending-idle-ms: ${ALERT_PENDING_IDLE_MS:60000}   # a failed event is retried after this long
+    max-deliveries: ${ALERT_MAX_DELIVERIES:5}          # then it goes to the DLQ
+    recovery-delay-ms: ${ALERT_RECOVERY_DELAY_MS:15000}
 management:
   endpoints:
     web:

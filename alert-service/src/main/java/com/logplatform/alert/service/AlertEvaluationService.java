@@ -36,7 +36,7 @@ public class AlertEvaluationService {
 
     @Transactional
     public void evaluate(ProcessedLogEvent e) {
-        if (e == null || e.tenantId() <= 0 || e.eventId() == null || e.timestamp() == null || e.severity() == null)
+        if (e == null || e.tenantId() == null || e.tenantId().isBlank() || e.tenantId().length() > 36 || e.eventId() == null || e.timestamp() == null || e.severity() == null)
             return;
         for (RuleEntity rule : rules.findByTenantIdAndEnabledTrue(e.tenantId())) {
             if (!matches(rule, e)) continue;

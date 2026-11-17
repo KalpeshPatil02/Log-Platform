@@ -49,7 +49,9 @@ class AlertEvaluationServiceTest {
                 1000L,
                 "alert:window:",
                 300L,
-                "notifications.out"
+                "notifications.out",
+                60000L,
+                5
         );
 
         evaluator = new AlertEvaluationService(
@@ -66,7 +68,7 @@ class AlertEvaluationServiceTest {
 
     @Test
     void eventWithInvalidTenantIsIgnored() {
-        ProcessedLogEvent event = event(0L);
+        ProcessedLogEvent event = event("");
 
         evaluator.evaluate(event);
 
@@ -76,10 +78,10 @@ class AlertEvaluationServiceTest {
     @Test
     void belowThresholdDoesNotCreateIncidentOrOutbox() {
         RuleEntity rule = matchingRule();
-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(4L);
 
-        evaluator.evaluate(event(42L));
+        evaluator.evaluate(event("tenant-42"));
 
         verify(counter).addAndCount(anyString(), eq("event-1"), eq(eventTime), eq(60));
         verify(incidents, never()).save(any(IncidentEntity.class));
@@ -89,25 +91,25 @@ class AlertEvaluationServiceTest {
     @Test
     void reachingThresholdCreatesIncidentAndNotificationOutbox() {
         RuleEntity rule = matchingRule();
-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
         when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(
-                eq(42L), anyString(), anyList()
+                eq("tenant-42"), anyString(), anyList()
         )).thenReturn(Optional.empty());
         when(incidents.save(any(IncidentEntity.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
-        evaluator.evaluate(event(42L));
+        evaluator.evaluate(event("tenant-42"));
 
         verify(incidents).save(argThat(incident ->
-                incident.getTenantId().equals(42L)
+                incident.getTenantId().equals("tenant-42")
                         && incident.getRuleId().equals(11L)
                         && incident.getStatus().equals("OPEN")
                         && incident.getTitle().equals("Payment API errors")
         ));
         verify(outbox).save(argThat(notification ->
-                notification.getTenantId() == 42L
-                        && notification.getEventKey().startsWith("incident-created:42:")
+                notification.getTenantId().equals("tenant-42")
+                        && notification.getEventKey().startsWith("incident-created:tenant-42:")
                         && notification.getPayload().contains("\"incidentId\"")
         ));
     }
@@ -116,16 +118,16 @@ class AlertEvaluationServiceTest {
     void matchingActiveIncidentIsTouchedInsteadOfCreatingAnotherIncident() {
         RuleEntity rule = matchingRule();
         IncidentEntity active = new IncidentEntity(
-                42L, 11L, "fingerprint", "Payment API errors", "existing incident", eventTime
+                "tenant-42", 11L, "fingerprint", "Payment API errors", "existing incident", eventTime
         );
 
-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
         when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(
-                eq(42L), anyString(), anyList()
+                eq("tenant-42"), anyString(), anyList()
         )).thenReturn(Optional.of(active));
 
-        evaluator.evaluate(event(42L));
+        evaluator.evaluate(event("tenant-42"));
 
         assertEquals(2L, active.getOccurrenceCount());
         assertEquals(eventTime, active.getLastSeenAt());
@@ -137,9 +139,9 @@ class AlertEvaluationServiceTest {
     void nonMatchingRuleDoesNotIncrementCounter() {
         RuleEntity rule = matchingRule();
         rule.setServiceName("different-service");
-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
 
-        evaluator.evaluate(event(42L));
+        evaluator.evaluate(event("tenant-42"));
 
         verifyNoInteractions(counter);
         verify(incidents, never()).save(any(IncidentEntity.class));
@@ -148,7 +150,7 @@ class AlertEvaluationServiceTest {
     private RuleEntity matchingRule() {
         RuleEntity rule = new RuleEntity();
         ReflectionTestUtils.setField(rule, "id", 11L);
-        rule.setTenantId(42L);
+        rule.setTenantId("tenant-42");
         rule.setName("Payment API errors");
         rule.setSeverity("ERROR");
         rule.setServiceName("payment-api");
@@ -160,7 +162,7 @@ class AlertEvaluationServiceTest {
         return rule;
     }
 
-    private ProcessedLogEvent event(long tenantId) {
+    private ProcessedLogEvent event(String tenantId) {
         return new ProcessedLogEvent(
                 "event-1",
                 tenantId,

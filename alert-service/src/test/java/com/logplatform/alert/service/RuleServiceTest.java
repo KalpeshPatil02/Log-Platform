@@ -30,9 +30,9 @@ class RuleServiceTest {
         when(repo.save(any(RuleEntity.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
-        RuleEntity result = service.create(42L, request);
+        RuleEntity result = service.create("tenant-42", request);
 
-        assertEquals(42L, result.getTenantId());
+        assertEquals("tenant-42", result.getTenantId());
         assertEquals("Payment errors", result.getName());
         assertEquals("ERROR", result.getSeverity());
         assertTrue(result.isEnabled());
@@ -42,21 +42,21 @@ class RuleServiceTest {
     @Test
     void listReturnsRulesForTenant() {
         List<RuleEntity> expected = List.of(new RuleEntity(), new RuleEntity());
-        when(repo.findByTenantId(42L)).thenReturn(expected);
+        when(repo.findByTenantId("tenant-42")).thenReturn(expected);
 
-        List<RuleEntity> result = service.list(42L);
+        List<RuleEntity> result = service.list("tenant-42");
 
         assertSame(expected, result);
-        verify(repo).findByTenantId(42L);
+        verify(repo).findByTenantId("tenant-42");
     }
 
     @Test
     void updateChangesRuleFieldsAndNormalizesSeverity() {
         RuleEntity existing = new RuleEntity();
-        existing.setTenantId(42L);
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(existing));
+        existing.setTenantId("tenant-42");
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(existing));
 
-        RuleEntity result = service.update(42L, 7L,
+        RuleEntity result = service.update("tenant-42", 7L,
                 new RuleRequest("Updated rule", "Updated description", "warn",
                         "billing-api", "production", 10, 120, 30, true));
 
@@ -74,11 +74,11 @@ class RuleServiceTest {
 
     @Test
     void updateThrowsWhenRuleDoesNotBelongToTenantOrDoesNotExist() {
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
 
         NoSuchElementException exception = assertThrows(
                 NoSuchElementException.class,
-                () -> service.update(42L, 7L, request("Rule", "ERROR", true))
+                () -> service.update("tenant-42", 7L, request("Rule", "ERROR", true))
         );
 
         assertEquals("Alert rule not found", exception.getMessage());
@@ -89,9 +89,9 @@ class RuleServiceTest {
     void deleteSoftDisablesRuleInsteadOfDeletingIt() {
         RuleEntity existing = new RuleEntity();
         existing.setEnabled(true);
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(existing));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(existing));
 
-        service.delete(42L, 7L);
+        service.delete("tenant-42", 7L);
 
         assertFalse(existing.isEnabled());
         verify(repo, never()).delete(any(RuleEntity.class));
@@ -99,11 +99,11 @@ class RuleServiceTest {
 
     @Test
     void deleteThrowsWhenRuleDoesNotBelongToTenantOrDoesNotExist() {
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
 
         NoSuchElementException exception = assertThrows(
                 NoSuchElementException.class,
-                () -> service.delete(42L, 7L)
+                () -> service.delete("tenant-42", 7L)
         );
 
         assertEquals("Alert rule not found", exception.getMessage());
@@ -113,7 +113,7 @@ class RuleServiceTest {
     void createRejectsUnsupportedSeverity() {
         RuleRequest request = request("Payment errors", "URGENT", true);
 
-        assertThrows(IllegalArgumentException.class, () -> service.create(42L, request));
+        assertThrows(IllegalArgumentException.class, () -> service.create("tenant-42", request));
 
         verify(repo, never()).save(any(RuleEntity.class));
     }
@@ -123,7 +123,7 @@ class RuleServiceTest {
         when(repo.save(any(RuleEntity.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
 
-        RuleEntity result = service.create(42L, request("All severities", null, true));
+        RuleEntity result = service.create("tenant-42", request("All severities", null, true));
 
         assertNull(result.getSeverity());
         verify(repo).save(any(RuleEntity.class));

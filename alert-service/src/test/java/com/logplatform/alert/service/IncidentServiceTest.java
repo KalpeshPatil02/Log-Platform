@@ -27,45 +27,45 @@ class IncidentServiceTest {
     @Test
     void listReturnsAllIncidentsForTenantWhenStatusIsNull() {
         List<IncidentEntity> expected = List.of(incident(), incident());
-        when(repo.findByTenantIdOrderByLastSeenAtDesc(42L)).thenReturn(expected);
+        when(repo.findByTenantIdOrderByLastSeenAtDesc("tenant-42")).thenReturn(expected);
 
-        List<IncidentEntity> result = service.list(42L, null);
+        List<IncidentEntity> result = service.list("tenant-42", null);
 
         assertSame(expected, result);
-        verify(repo).findByTenantIdOrderByLastSeenAtDesc(42L);
-        verify(repo, never()).findByTenantIdAndStatusOrderByLastSeenAtDesc(anyLong(), anyString());
+        verify(repo).findByTenantIdOrderByLastSeenAtDesc("tenant-42");
+        verify(repo, never()).findByTenantIdAndStatusOrderByLastSeenAtDesc(anyString(), anyString());
     }
 
     @Test
     void listNormalizesStatusToUppercase() {
         List<IncidentEntity> expected = List.of(incident());
-        when(repo.findByTenantIdAndStatusOrderByLastSeenAtDesc(42L, "ACKNOWLEDGED"))
+        when(repo.findByTenantIdAndStatusOrderByLastSeenAtDesc("tenant-42", "ACKNOWLEDGED"))
                 .thenReturn(expected);
 
-        List<IncidentEntity> result = service.list(42L, "acknowledged");
+        List<IncidentEntity> result = service.list("tenant-42", "acknowledged");
 
         assertSame(expected, result);
-        verify(repo).findByTenantIdAndStatusOrderByLastSeenAtDesc(42L, "ACKNOWLEDGED");
+        verify(repo).findByTenantIdAndStatusOrderByLastSeenAtDesc("tenant-42", "ACKNOWLEDGED");
     }
 
     @Test
     void getReturnsIncidentBelongingToTenant() {
         IncidentEntity expected = incident();
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(expected));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(expected));
 
-        IncidentEntity result = service.get(42L, 7L);
+        IncidentEntity result = service.get("tenant-42", 7L);
 
         assertSame(expected, result);
-        verify(repo).findByIdAndTenantId(7L, 42L);
+        verify(repo).findByIdAndTenantId(7L, "tenant-42");
     }
 
     @Test
     void getThrowsWhenIncidentDoesNotBelongToTenantOrDoesNotExist() {
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
 
         NoSuchElementException exception = assertThrows(
                 NoSuchElementException.class,
-                () -> service.get(42L, 7L)
+                () -> service.get("tenant-42", 7L)
         );
 
         assertEquals("Incident not found", exception.getMessage());
@@ -74,9 +74,9 @@ class IncidentServiceTest {
     @Test
     void acknowledgeChangesOpenIncidentToAcknowledged() {
         IncidentEntity incident = incident();
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
-        IncidentEntity result = service.acknowledge(42L, 7L, "admin-user");
+        IncidentEntity result = service.acknowledge("tenant-42", 7L, "admin-user");
 
         assertSame(incident, result);
         assertEquals("ACKNOWLEDGED", result.getStatus());
@@ -87,11 +87,11 @@ class IncidentServiceTest {
     void acknowledgeRejectsIncidentThatIsNotOpen() {
         IncidentEntity incident = incident();
         incident.acknowledge("first-admin");
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
         assertThrows(
                 IllegalStateException.class,
-                () -> service.acknowledge(42L, 7L, "second-admin")
+                () -> service.acknowledge("tenant-42", 7L, "second-admin")
         );
 
         assertEquals("ACKNOWLEDGED", incident.getStatus());
@@ -101,9 +101,9 @@ class IncidentServiceTest {
     @Test
     void assignUpdatesAssignee() {
         IncidentEntity incident = incident();
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
-        IncidentEntity result = service.assign(42L, 7L, "on-call-engineer");
+        IncidentEntity result = service.assign("tenant-42", 7L, "on-call-engineer");
 
         assertSame(incident, result);
         assertEquals("on-call-engineer", result.getAssignedTo());
@@ -113,11 +113,11 @@ class IncidentServiceTest {
     void assignRejectsResolvedIncident() {
         IncidentEntity incident = incident();
         incident.resolve(Instant.parse("2026-11-14T06:00:00Z"));
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
         assertThrows(
                 IllegalStateException.class,
-                () -> service.assign(42L, 7L, "on-call-engineer")
+                () -> service.assign("tenant-42", 7L, "on-call-engineer")
         );
 
         assertNull(incident.getAssignedTo());
@@ -126,9 +126,9 @@ class IncidentServiceTest {
     @Test
     void resolveChangesIncidentToResolved() {
         IncidentEntity incident = incident();
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
-        IncidentEntity result = service.resolve(42L, 7L);
+        IncidentEntity result = service.resolve("tenant-42", 7L);
 
         assertSame(incident, result);
         assertEquals("RESOLVED", result.getStatus());
@@ -140,9 +140,9 @@ class IncidentServiceTest {
         IncidentEntity incident = incident();
         Instant originalResolvedAt = Instant.parse("2026-11-14T06:00:00Z");
         incident.resolve(originalResolvedAt);
-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
+        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
 
-        IncidentEntity result = service.resolve(42L, 7L);
+        IncidentEntity result = service.resolve("tenant-42", 7L);
 
         assertSame(incident, result);
         assertEquals("RESOLVED", result.getStatus());
@@ -152,7 +152,7 @@ class IncidentServiceTest {
     private IncidentEntity incident() {
         Instant now = Instant.parse("2026-11-14T05:00:00Z");
         return new IncidentEntity(
-                42L,
+                "tenant-42",
                 3L,
                 "fingerprint-123",
                 "Payment API errors",

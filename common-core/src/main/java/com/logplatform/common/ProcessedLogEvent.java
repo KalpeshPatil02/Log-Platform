@@ -7,7 +7,7 @@ import java.time.Instant;
  */
 public record ProcessedLogEvent(
         String eventId,
-        long tenantId,
+        String tenantId,
         Instant timestamp,
         String service,
         String environment,

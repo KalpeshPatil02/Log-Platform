@@ -12,7 +12,7 @@ This module is added against the actual uploaded `log-platform` source tree (Spr
 - Flyway schema, Dockerfile, Compose profile, actuator health endpoints.
 
 ## Important engineering notes / limitations
-1. This package matches the uploaded code's `ProcessedLogEvent` record exactly: `eventId`, numeric `tenantId`, `timestamp`, `service`, `environment`, `severity`, `message`, `traceId`, `fingerprint`.
+1. This package matches the uploaded code's `ProcessedLogEvent` record exactly: `eventId`, `tenantId` (UUID string, same as identity-service), `timestamp`, `service`, `environment`, `severity`, `message`, `traceId`, `fingerprint`.
 2. Gateway must route `/api/v1/alert-rules/**` and `/api/v1/incidents/**` to `http://alert-service:8086` (or `http://localhost:8086` when running on host). Add those routes to `api-gateway/src/main/resources/application.yml`. The existing Gateway strips spoofed tenant headers and re-adds verified JWT claims. The Alert Service currently treats `X-Tenant-Id` as trusted internal context; do not expose port 8086 publicly in production. For direct host testing, this trust boundary is not secure by itself.
 3. `notification-service` is Phase 7 and is not in this package. This service publishes versioned JSON payloads on `notifications.out` with fields `eventKey`, `tenantId`, and `payload`.
 4. Consumer ACK occurs after the transactional evaluator returns. The implementation is an initial Phase 6 baseline, not a claim of fully verified production-grade pending-message reclaim/concurrency recovery. The consumer group persists pending entries; a dedicated XPENDING/XAUTOCLAIM recovery worker and robust concurrent active-fingerprint locking should be added before declaring Phase 6 production-complete.
