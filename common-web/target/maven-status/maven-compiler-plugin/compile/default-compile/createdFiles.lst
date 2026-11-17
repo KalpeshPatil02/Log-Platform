@@ -1,7 +1,0 @@
-com/logplatform/web/ApiError.class
-com/logplatform/web/RequestSizeLimitFilter.class
-com/logplatform/web/GlobalExceptionHandler.class
-com/logplatform/web/SecurityErrorAdvice.class
-com/logplatform/web/WebCommonAutoConfiguration$SecurityAdviceConfiguration.class
-com/logplatform/web/WebCommonAutoConfiguration.class
-com/logplatform/web/CorrelationIdFilter.class

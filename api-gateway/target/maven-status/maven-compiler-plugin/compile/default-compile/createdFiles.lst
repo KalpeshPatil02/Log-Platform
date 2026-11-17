@@ -1,8 +1,0 @@
-com/logplatform/gateway/filter/TenantContextGlobalFilter.class
-com/logplatform/gateway/config/RateLimitConfig.class
-com/logplatform/gateway/config/GatewayProperties$Jwt.class
-com/logplatform/gateway/config/GatewayProperties.class
-com/logplatform/gateway/config/SecurityConfig.class
-com/logplatform/gateway/ApiGatewayApplication.class
-com/logplatform/gateway/filter/CorrelationIdWebFilter.class
-com/logplatform/gateway/security/JsonErrorWriter.class

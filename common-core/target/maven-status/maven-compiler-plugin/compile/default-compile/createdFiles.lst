@@ -1,8 +1,0 @@
-com/logplatform/common/ApiException.class
-com/logplatform/common/Streams.class
-com/logplatform/common/Headers.class
-com/logplatform/common/Role.class
-com/logplatform/common/RawLogEvent.class
-com/logplatform/common/Hashing.class
-com/logplatform/common/Severity.class
-com/logplatform/common/ProcessedLogEvent.class
