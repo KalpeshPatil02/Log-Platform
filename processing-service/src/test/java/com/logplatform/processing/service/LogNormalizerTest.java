@@ -56,6 +56,20 @@ class LogNormalizerTest {
  }
 
  @Test
+ void shouldNormalizeWarningAliasToWarn() {
+  NormalizedLog result = normalizer.normalize(validEvent("WARNING"));
+
+  assertEquals("WARN", result.severity());
+ }
+
+ @Test
+ void shouldNormalizeErrAliasToError() {
+  NormalizedLog result = normalizer.normalize(validEvent("ERR"));
+
+  assertEquals("ERROR", result.severity());
+ }
+
+ @Test
  void shouldRejectUnsupportedSeverity() {
   RawLogEvent raw = validEvent("UNKNOWN");
 

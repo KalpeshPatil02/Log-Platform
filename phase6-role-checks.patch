@@ -1,0 +1,328 @@
+diff --git a/alert-service/README.md b/alert-service/README.md
+index 8fb4ae2..fdeb90c 100644
+--- a/alert-service/README.md
++++ b/alert-service/README.md
+@@ -54,3 +54,14 @@ Example rule:
+ ```json
+ {"name":"Payment API errors","description":"5 errors in 60 seconds","severity":"ERROR","serviceName":"payment-api","environment":"production","thresholdCount":5,"windowSeconds":60,"cooldownSeconds":300,"enabled":true}
+ ```
++
++
++## Roles
++
++The gateway copies the JWT `roles` claim into `X-User-Roles`; alert-service enforces it (no recognised role = 403).
++
++| Action | PLATFORM_ADMIN | TENANT_ADMIN | DEVELOPER | VIEWER |
++|---|---|---|---|---|
++| List/get rules and incidents | yes | yes | yes | yes |
++| Create/update/delete rules | no | yes | yes | no |
++| Acknowledge/assign/resolve incidents | no | yes | yes | no |
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java b/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
+index fa07083..c8e1fbb 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
+@@ -1,9 +1,57 @@
+ package com.logplatform.alert.web;
+-import com.logplatform.alert.service.RuleService;import jakarta.validation.Valid;import org.springframework.http.HttpStatus;import org.springframework.web.bind.annotation.*;import java.util.*;
+-@RestController @RequestMapping("/api/v1/alert-rules") public class AlertRuleController {private final RuleService service;public AlertRuleController(RuleService s){service=s;}
+- private String tenant(String h){return TenantHeader.require(h);}
+- @PostMapping @ResponseStatus(HttpStatus.CREATED) public RuleResponse create(@RequestHeader("X-Tenant-Id") String t,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.create(tenant(t),q));}
+- @GetMapping public List<RuleResponse> list(@RequestHeader("X-Tenant-Id") String t){return service.list(tenant(t)).stream().map(RuleResponse::from).toList();}
+- @PutMapping("/{id}") public RuleResponse update(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.update(tenant(t),id,q));}
+- @DeleteMapping("/{id}") @ResponseStatus(HttpStatus.NO_CONTENT) public void delete(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){service.delete(tenant(t),id);}
++
++import com.logplatform.alert.service.RuleService;
++import jakarta.validation.Valid;
++import org.springframework.http.HttpStatus;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.List;
++
++@RestController
++@RequestMapping("/api/v1/alert-rules")
++public class AlertRuleController {
++
++    private final RuleService service;
++
++    public AlertRuleController(RuleService s) {
++        service = s;
++    }
++
++    private String tenant(String h) {
++        return TenantHeader.require(h);
++    }
++
++    @PostMapping
++    @ResponseStatus(HttpStatus.CREATED)
++    public RuleResponse create(@RequestHeader("X-Tenant-Id") String t,
++                               @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                               @Valid @RequestBody RuleRequest q) {
++        RoleGuard.requireWrite(roles);
++        return RuleResponse.from(service.create(tenant(t), q));
++    }
++
++    @GetMapping
++    public List<RuleResponse> list(@RequestHeader("X-Tenant-Id") String t,
++                                   @RequestHeader(value = "X-User-Roles", required = false) String roles) {
++        RoleGuard.requireRead(roles);
++        return service.list(tenant(t)).stream().map(RuleResponse::from).toList();
++    }
++
++    @PutMapping("/{id}")
++    public RuleResponse update(@RequestHeader("X-Tenant-Id") String t,
++                               @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                               @PathVariable long id,
++                               @Valid @RequestBody RuleRequest q) {
++        RoleGuard.requireWrite(roles);
++        return RuleResponse.from(service.update(tenant(t), id, q));
++    }
++
++    @DeleteMapping("/{id}")
++    @ResponseStatus(HttpStatus.NO_CONTENT)
++    public void delete(@RequestHeader("X-Tenant-Id") String t,
++                       @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                       @PathVariable long id) {
++        RoleGuard.requireWrite(roles);
++        service.delete(tenant(t), id);
++    }
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/ApiExceptionHandler.java b/alert-service/src/main/java/com/logplatform/alert/web/ApiExceptionHandler.java
+index d73bcf7..d9e094b 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/ApiExceptionHandler.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/ApiExceptionHandler.java
+@@ -1,6 +1,7 @@
+ package com.logplatform.alert.web;
+ import org.springframework.http.*;import org.springframework.web.bind.MethodArgumentNotValidException;import org.springframework.web.bind.annotation.*;import java.util.*;
+ @RestControllerAdvice public class ApiExceptionHandler {
++ @ExceptionHandler(ForbiddenException.class) @ResponseStatus(HttpStatus.FORBIDDEN) public Map<String,Object> forbidden(Exception e){return Map.of("status",403,"error","FORBIDDEN","message",e.getMessage());}
+  @ExceptionHandler(NoSuchElementException.class) @ResponseStatus(HttpStatus.NOT_FOUND) public Map<String,Object> notFound(Exception e){return Map.of("status",404,"error","NOT_FOUND","message",e.getMessage());}
+  @ExceptionHandler({IllegalArgumentException.class,IllegalStateException.class}) @ResponseStatus(HttpStatus.BAD_REQUEST) public Map<String,Object> bad(Exception e){return Map.of("status",400,"error","BAD_REQUEST","message",e.getMessage()==null?"Invalid request":e.getMessage());}
+  @ExceptionHandler(MethodArgumentNotValidException.class) @ResponseStatus(HttpStatus.BAD_REQUEST) public Map<String,Object> validation(MethodArgumentNotValidException e){return Map.of("status",400,"error","VALIDATION_ERROR","message","Request validation failed");}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/ForbiddenException.java b/alert-service/src/main/java/com/logplatform/alert/web/ForbiddenException.java
+new file mode 100644
+index 0000000..809ae83
+--- /dev/null
++++ b/alert-service/src/main/java/com/logplatform/alert/web/ForbiddenException.java
+@@ -0,0 +1,8 @@
++package com.logplatform.alert.web;
++
++/** Thrown when the caller's role may not perform the request. Mapped to HTTP 403. */
++public class ForbiddenException extends RuntimeException {
++    public ForbiddenException(String message) {
++        super(message);
++    }
++}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java b/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
+index e827d54..c3d9f81 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
+@@ -1,10 +1,64 @@
+ package com.logplatform.alert.web;
+-import com.logplatform.alert.service.IncidentService;import jakarta.validation.Valid;import org.springframework.web.bind.annotation.*;import java.util.*;
+-@RestController @RequestMapping("/api/v1/incidents") public class IncidentController {private final IncidentService service;public IncidentController(IncidentService s){service=s;}
+- private String tenant(String h){return TenantHeader.require(h);}
+- @GetMapping public List<IncidentResponse> list(@RequestHeader("X-Tenant-Id") String t,@RequestParam(required=false) String status){return service.list(tenant(t),status).stream().map(IncidentResponse::from).toList();}
+- @GetMapping("/{id}") public IncidentResponse get(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){return IncidentResponse.from(service.get(tenant(t),id));}
+- @PostMapping("/{id}/acknowledge") public IncidentResponse acknowledge(@RequestHeader("X-Tenant-Id") String t,@RequestHeader(value="X-User-Id",defaultValue="system") String actor,@PathVariable long id){return IncidentResponse.from(service.acknowledge(tenant(t),id,actor));}
+- @PostMapping("/{id}/assign") public IncidentResponse assign(@RequestHeader("X-Tenant-Id") String t,@Valid @RequestBody ActionRequest q,@PathVariable long id){return IncidentResponse.from(service.assign(tenant(t),id,q.value()));}
+- @PostMapping("/{id}/resolve") public IncidentResponse resolve(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){return IncidentResponse.from(service.resolve(tenant(t),id));}
++
++import com.logplatform.alert.service.IncidentService;
++import jakarta.validation.Valid;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.List;
++
++@RestController
++@RequestMapping("/api/v1/incidents")
++public class IncidentController {
++
++    private final IncidentService service;
++
++    public IncidentController(IncidentService s) {
++        service = s;
++    }
++
++    private String tenant(String h) {
++        return TenantHeader.require(h);
++    }
++
++    @GetMapping
++    public List<IncidentResponse> list(@RequestHeader("X-Tenant-Id") String t,
++                                       @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                                       @RequestParam(required = false) String status) {
++        RoleGuard.requireRead(roles);
++        return service.list(tenant(t), status).stream().map(IncidentResponse::from).toList();
++    }
++
++    @GetMapping("/{id}")
++    public IncidentResponse get(@RequestHeader("X-Tenant-Id") String t,
++                                @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                                @PathVariable long id) {
++        RoleGuard.requireRead(roles);
++        return IncidentResponse.from(service.get(tenant(t), id));
++    }
++
++    @PostMapping("/{id}/acknowledge")
++    public IncidentResponse acknowledge(@RequestHeader("X-Tenant-Id") String t,
++                                        @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                                        @RequestHeader(value = "X-User-Id", defaultValue = "system") String actor,
++                                        @PathVariable long id) {
++        RoleGuard.requireWrite(roles);
++        return IncidentResponse.from(service.acknowledge(tenant(t), id, actor));
++    }
++
++    @PostMapping("/{id}/assign")
++    public IncidentResponse assign(@RequestHeader("X-Tenant-Id") String t,
++                                   @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                                   @Valid @RequestBody ActionRequest q,
++                                   @PathVariable long id) {
++        RoleGuard.requireWrite(roles);
++        return IncidentResponse.from(service.assign(tenant(t), id, q.value()));
++    }
++
++    @PostMapping("/{id}/resolve")
++    public IncidentResponse resolve(@RequestHeader("X-Tenant-Id") String t,
++                                    @RequestHeader(value = "X-User-Roles", required = false) String roles,
++                                    @PathVariable long id) {
++        RoleGuard.requireWrite(roles);
++        return IncidentResponse.from(service.resolve(tenant(t), id));
++    }
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/RoleGuard.java b/alert-service/src/main/java/com/logplatform/alert/web/RoleGuard.java
+new file mode 100644
+index 0000000..cf47cf4
+--- /dev/null
++++ b/alert-service/src/main/java/com/logplatform/alert/web/RoleGuard.java
+@@ -0,0 +1,40 @@
++package com.logplatform.alert.web;
++
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * Role policy for alert-service. The gateway copies the JWT "roles" claim into X-User-Roles
++ * (comma separated) and strips any value sent by the client.
++ *
++ *   read   (GET)                                  : PLATFORM_ADMIN, TENANT_ADMIN, DEVELOPER, VIEWER
++ *   change (rules: create/update/delete,
++ *           incidents: acknowledge/assign/resolve) : TENANT_ADMIN, DEVELOPER
++ *
++ * No recognised role in the header means no access (fail closed).
++ */
++final class RoleGuard {
++    static final Set<String> READ = Set.of("PLATFORM_ADMIN", "TENANT_ADMIN", "DEVELOPER", "VIEWER");
++    static final Set<String> WRITE = Set.of("TENANT_ADMIN", "DEVELOPER");
++
++    private RoleGuard() {}
++
++    static void requireRead(String rolesHeader) {
++        require(rolesHeader, READ);
++    }
++
++    static void requireWrite(String rolesHeader) {
++        require(rolesHeader, WRITE);
++    }
++
++    private static void require(String rolesHeader, Set<String> allowed) {
++        if (rolesHeader != null) {
++            for (String role : rolesHeader.split(",")) {
++                if (allowed.contains(role.trim().toUpperCase(Locale.ROOT))) {
++                    return;
++                }
++            }
++        }
++        throw new ForbiddenException("Your role is not allowed to perform this action");
++    }
++}
+diff --git a/alert-service/src/test/java/com/logplatform/alert/web/RoleEnforcementTest.java b/alert-service/src/test/java/com/logplatform/alert/web/RoleEnforcementTest.java
+new file mode 100644
+index 0000000..e4c8ae7
+--- /dev/null
++++ b/alert-service/src/test/java/com/logplatform/alert/web/RoleEnforcementTest.java
+@@ -0,0 +1,85 @@
++package com.logplatform.alert.web;
++
++import com.logplatform.alert.domain.IncidentEntity;
++import com.logplatform.alert.service.IncidentService;
++import com.logplatform.alert.service.RuleService;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.time.Instant;
++
++import static org.junit.jupiter.api.Assertions.*;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.*;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++class RoleEnforcementTest {
++
++    private RuleService rules;
++    private IncidentService incidents;
++    private MockMvc mvc;
++
++    @BeforeEach
++    void setUp() {
++        rules = mock(RuleService.class);
++        incidents = mock(IncidentService.class);
++        mvc = MockMvcBuilders
++                .standaloneSetup(new AlertRuleController(rules), new IncidentController(incidents))
++                .setControllerAdvice(new ApiExceptionHandler())
++                .build();
++    }
++
++    @Test
++    void viewerCanReadButCannotDeleteRules() throws Exception {
++        mvc.perform(get("/api/v1/alert-rules").header("X-Tenant-Id", "t1").header("X-User-Roles", "VIEWER"))
++                .andExpect(status().isOk());
++        mvc.perform(delete("/api/v1/alert-rules/1").header("X-Tenant-Id", "t1").header("X-User-Roles", "VIEWER"))
++                .andExpect(status().isForbidden());
++        verify(rules, never()).delete(anyString(), anyLong());
++    }
++
++    @Test
++    void developerAndTenantAdminCanDeleteRules() throws Exception {
++        mvc.perform(delete("/api/v1/alert-rules/1").header("X-Tenant-Id", "t1").header("X-User-Roles", "DEVELOPER"))
++                .andExpect(status().isNoContent());
++        mvc.perform(delete("/api/v1/alert-rules/2").header("X-Tenant-Id", "t1").header("X-User-Roles", "TENANT_ADMIN"))
++                .andExpect(status().isNoContent());
++        verify(rules).delete("t1", 1L);
++        verify(rules).delete("t1", 2L);
++    }
++
++    @Test
++    void missingOrUnknownRolesAreDenied() throws Exception {
++        mvc.perform(get("/api/v1/alert-rules").header("X-Tenant-Id", "t1"))
++                .andExpect(status().isForbidden());
++        mvc.perform(get("/api/v1/alert-rules").header("X-Tenant-Id", "t1").header("X-User-Roles", "HACKER"))
++                .andExpect(status().isForbidden());
++        verifyNoInteractions(rules);
++    }
++
++    @Test
++    void viewerCannotChangeIncidentsButDeveloperCan() throws Exception {
++        IncidentEntity incident = new IncidentEntity("t1", 1L, "fp", "title", "desc", Instant.now());
++        when(incidents.resolve(eq("t1"), eq(1L))).thenReturn(incident);
++
++        mvc.perform(post("/api/v1/incidents/1/resolve").header("X-Tenant-Id", "t1").header("X-User-Roles", "VIEWER"))
++                .andExpect(status().isForbidden());
++        verify(incidents, never()).resolve(anyString(), anyLong());
++
++        mvc.perform(post("/api/v1/incidents/1/resolve").header("X-Tenant-Id", "t1").header("X-User-Roles", "DEVELOPER"))
++                .andExpect(status().isOk());
++        verify(incidents).resolve("t1", 1L);
++    }
++
++    @Test
++    void rolesHeaderMayContainSeveralRoles() {
++        assertDoesNotThrow(() -> RoleGuard.requireWrite("VIEWER, developer"));
++        assertThrows(ForbiddenException.class, () -> RoleGuard.requireWrite("VIEWER,PLATFORM_ADMIN"));
++        assertThrows(ForbiddenException.class, () -> RoleGuard.requireWrite(null));
++    }
++}

@@ -1,26 +1,18 @@
 package com.logplatform.processing.service;
 
+import com.logplatform.common.Severity;
 import com.logplatform.processing.domain.NormalizedLog;
 import com.logplatform.processing.domain.RawLogEvent;
 import org.springframework.stereotype.Component;
 
-import java.util.Locale;
-import java.util.Set;
-
 @Component
 public class LogNormalizer {
 
- private static final Set<String> LEVELS =
-         Set.of("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL");
-
  public NormalizedLog normalize(RawLogEvent event) {
-  String severity = event.severity().trim().toUpperCase(Locale.ROOT);
-
-  if (!LEVELS.contains(severity)) {
-   throw new IllegalArgumentException(
-           "Unsupported severity: " + event.severity()
-   );
-  }
+  Severity severity = Severity.parse(event.severity())
+          .orElseThrow(() -> new IllegalArgumentException(
+                  "Unsupported severity: " + event.severity()
+          ));
 
   String tenantId = event.tenantId().trim();
   String eventId = event.eventId().trim();
@@ -51,7 +43,7 @@ public class LogNormalizer {
           event.timestamp(),
           service,
           environment,
-          severity,
+          severity.name(),
           event.message(),
           event.traceId(),
           event.correlationId(),

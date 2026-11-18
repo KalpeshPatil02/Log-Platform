@@ -1,0 +1,1060 @@
+diff --git a/alert-service/README.md b/alert-service/README.md
+index 226d02a..8fb4ae2 100644
+--- a/alert-service/README.md
++++ b/alert-service/README.md
+@@ -12,7 +12,7 @@ This module is added against the actual uploaded `log-platform` source tree (Spr
+ - Flyway schema, Dockerfile, Compose profile, actuator health endpoints.
+ 
+ ## Important engineering notes / limitations
+-1. This package matches the uploaded code's `ProcessedLogEvent` record exactly: `eventId`, numeric `tenantId`, `timestamp`, `service`, `environment`, `severity`, `message`, `traceId`, `fingerprint`.
++1. This package matches the uploaded code's `ProcessedLogEvent` record exactly: `eventId`, `tenantId` (UUID string, same as identity-service), `timestamp`, `service`, `environment`, `severity`, `message`, `traceId`, `fingerprint`.
+ 2. Gateway must route `/api/v1/alert-rules/**` and `/api/v1/incidents/**` to `http://alert-service:8086` (or `http://localhost:8086` when running on host). Add those routes to `api-gateway/src/main/resources/application.yml`. The existing Gateway strips spoofed tenant headers and re-adds verified JWT claims. The Alert Service currently treats `X-Tenant-Id` as trusted internal context; do not expose port 8086 publicly in production. For direct host testing, this trust boundary is not secure by itself.
+ 3. `notification-service` is Phase 7 and is not in this package. This service publishes versioned JSON payloads on `notifications.out` with fields `eventKey`, `tenantId`, and `payload`.
+ 4. Consumer ACK occurs after the transactional evaluator returns. The implementation is an initial Phase 6 baseline, not a claim of fully verified production-grade pending-message reclaim/concurrency recovery. The consumer group persists pending entries; a dedicated XPENDING/XAUTOCLAIM recovery worker and robust concurrent active-fingerprint locking should be added before declaring Phase 6 production-complete.
+diff --git a/alert-service/src/main/java/com/logplatform/alert/config/AlertProperties.java b/alert-service/src/main/java/com/logplatform/alert/config/AlertProperties.java
+index a721721..f0fcdae 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/config/AlertProperties.java
++++ b/alert-service/src/main/java/com/logplatform/alert/config/AlertProperties.java
+@@ -1,5 +1,7 @@
+ package com.logplatform.alert.config;
+ import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.boot.context.properties.bind.DefaultValue;
+ @ConfigurationProperties(prefix="app.alert")
+ public record AlertProperties(String processedStream, String deadLetterStream, String consumerGroup,
+- String consumerName, long pollDelayMs, String windowKeyPrefix, long cooldownSeconds, String notificationStream) { }
++ String consumerName, long pollDelayMs, String windowKeyPrefix, long cooldownSeconds, String notificationStream,
++ @DefaultValue("60000") long pendingIdleMs, @DefaultValue("5") int maxDeliveries) { }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/domain/IncidentEntity.java b/alert-service/src/main/java/com/logplatform/alert/domain/IncidentEntity.java
+index e5d5bd9..10607a0 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/domain/IncidentEntity.java
++++ b/alert-service/src/main/java/com/logplatform/alert/domain/IncidentEntity.java
+@@ -11,8 +11,8 @@ public class IncidentEntity {
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+ 
+- @Column(name = "tenant_id", nullable = false)
+- private Long tenantId;
++ @Column(name = "tenant_id", nullable = false, length = 36)
++ private String tenantId;
+ 
+  @Column(name = "rule_id", nullable = false)
+  private Long ruleId;
+@@ -20,6 +20,10 @@ public class IncidentEntity {
+  @Column(nullable = false, length = 128)
+  private String fingerprint;
+ 
++ /** Equals fingerprint while OPEN/ACKNOWLEDGED, NULL once RESOLVED. Unique per tenant, so a fingerprint can be resolved many times. */
++ @Column(name = "active_fingerprint", length = 128)
++ private String activeFingerprint;
++
+  @Column(nullable = false, length = 24)
+  private String status;
+ 
+@@ -54,7 +58,7 @@ public class IncidentEntity {
+  }
+ 
+  public IncidentEntity(
+-         long tenantId,
++         String tenantId,
+          long ruleId,
+          String fingerprint,
+          String title,
+@@ -65,7 +69,7 @@ public class IncidentEntity {
+  }
+ 
+  public IncidentEntity(
+-         long tenantId,
++         String tenantId,
+          long ruleId,
+          String fingerprint,
+          String title,
+@@ -76,6 +80,7 @@ public class IncidentEntity {
+   this.tenantId = tenantId;
+   this.ruleId = ruleId;
+   this.fingerprint = fingerprint;
++  this.activeFingerprint = fingerprint;
+   this.title = title;
+   this.description = description;
+   this.status = "OPEN";
+@@ -85,9 +90,10 @@ public class IncidentEntity {
+  }
+ 
+  public Long getId() { return id; }
+- public Long getTenantId() { return tenantId; }
++ public String getTenantId() { return tenantId; }
+  public Long getRuleId() { return ruleId; }
+  public String getFingerprint() { return fingerprint; }
++ public String getActiveFingerprint() { return activeFingerprint; }
+  public String getStatus() { return status; }
+  public String getTitle() { return title; }
+  public String getDescription() { return description; }
+@@ -125,6 +131,7 @@ public class IncidentEntity {
+  public void resolve(Instant t) {
+   if (status.equals("RESOLVED")) return;
+   status = "RESOLVED";
++  activeFingerprint = null;
+   resolvedAt = t;
+  }
+ }
+\ No newline at end of file
+diff --git a/alert-service/src/main/java/com/logplatform/alert/domain/NotificationOutboxEntity.java b/alert-service/src/main/java/com/logplatform/alert/domain/NotificationOutboxEntity.java
+index a7249f4..bdb4e4e 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/domain/NotificationOutboxEntity.java
++++ b/alert-service/src/main/java/com/logplatform/alert/domain/NotificationOutboxEntity.java
+@@ -4,7 +4,7 @@ import jakarta.persistence.*; import java.time.Instant;
+ public class NotificationOutboxEntity {
+  @Id @GeneratedValue(strategy=GenerationType.IDENTITY) private Long id;
+  @Column(name="event_key",nullable=false,unique=true) private String eventKey;
+- @Column(name="tenant_id",nullable=false) private Long tenantId;
++ @Column(name="tenant_id",nullable=false,length=36) private String tenantId;
+  @Column(nullable=false,columnDefinition="json") private String payload;
+  @Column(nullable=false) private String status="PENDING";
+  @Column(nullable=false) private int attempts=0;
+@@ -13,6 +13,6 @@ public class NotificationOutboxEntity {
+  @Column(name="published_at") private Instant publishedAt;
+  @Column(name="last_error",length=1000) private String lastError;
+  protected NotificationOutboxEntity(){}
+- public NotificationOutboxEntity(String key,long tenant,String payload,Instant now){eventKey=key;tenantId=tenant;this.payload=payload;createdAt=nextAttemptAt=now;}
+- public Long getId(){return id;} public String getEventKey(){return eventKey;} public long getTenantId(){return tenantId;} public String getPayload(){return payload;} public int getAttempts(){return attempts;} public void published(Instant t){status="PUBLISHED";publishedAt=t;lastError=null;} public void failed(String e,Instant next){status="PENDING";attempts++;lastError=e==null?"unknown":e.substring(0,Math.min(1000,e.length()));nextAttemptAt=next;}
++ public NotificationOutboxEntity(String key,String tenant,String payload,Instant now){eventKey=key;tenantId=tenant;this.payload=payload;createdAt=nextAttemptAt=now;}
++ public Long getId(){return id;} public String getEventKey(){return eventKey;} public String getTenantId(){return tenantId;} public String getPayload(){return payload;} public int getAttempts(){return attempts;} public void published(Instant t){status="PUBLISHED";publishedAt=t;lastError=null;} public void failed(String e,Instant next){status="PENDING";attempts++;lastError=e==null?"unknown":e.substring(0,Math.min(1000,e.length()));nextAttemptAt=next;}
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/domain/RuleEntity.java b/alert-service/src/main/java/com/logplatform/alert/domain/RuleEntity.java
+index 05f7f3c..8b0bb40 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/domain/RuleEntity.java
++++ b/alert-service/src/main/java/com/logplatform/alert/domain/RuleEntity.java
+@@ -3,7 +3,7 @@ import jakarta.persistence.*; import java.time.Instant;
+ @Entity @Table(name="alert_rules")
+ public class RuleEntity {
+  @Id @GeneratedValue(strategy=GenerationType.IDENTITY) private Long id;
+- @Column(name="tenant_id",nullable=false) private Long tenantId;
++ @Column(name="tenant_id",nullable=false,length=36) private String tenantId;
+  @Column(nullable=false,length=150) private String name;
+  @Column(length=500) private String description;
+  @Column(length=16) private String severity;
+@@ -16,7 +16,7 @@ public class RuleEntity {
+  @Column(name="created_at",nullable=false) private Instant createdAt;
+  @Column(name="updated_at",nullable=false) private Instant updatedAt;
+  @PrePersist void create(){createdAt=updatedAt=Instant.now();} @PreUpdate void update(){updatedAt=Instant.now();}
+- public Long getId(){return id;} public Long getTenantId(){return tenantId;} public void setTenantId(Long v){tenantId=v;}
++ public Long getId(){return id;} public String getTenantId(){return tenantId;} public void setTenantId(String v){tenantId=v;}
+  public String getName(){return name;} public void setName(String v){name=v;} public String getDescription(){return description;} public void setDescription(String v){description=v;}
+  public String getSeverity(){return severity;} public void setSeverity(String v){severity=v;} public String getServiceName(){return serviceName;} public void setServiceName(String v){serviceName=v;}
+  public String getEnvironment(){return environment;} public void setEnvironment(String v){environment=v;} public int getThresholdCount(){return thresholdCount;} public void setThresholdCount(int v){thresholdCount=v;}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/repository/IncidentRepository.java b/alert-service/src/main/java/com/logplatform/alert/repository/IncidentRepository.java
+index 952565e..28e3422 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/repository/IncidentRepository.java
++++ b/alert-service/src/main/java/com/logplatform/alert/repository/IncidentRepository.java
+@@ -1,3 +1,3 @@
+ package com.logplatform.alert.repository;
+ import com.logplatform.alert.domain.IncidentEntity; import org.springframework.data.jpa.repository.JpaRepository; import java.util.*;
+-public interface IncidentRepository extends JpaRepository<IncidentEntity,Long>{ Optional<IncidentEntity> findFirstByTenantIdAndFingerprintAndStatusIn(Long tenant,String fp,Collection<String> statuses); Optional<IncidentEntity> findByIdAndTenantId(Long id,Long tenant); List<IncidentEntity> findByTenantIdOrderByLastSeenAtDesc(Long tenant); List<IncidentEntity> findByTenantIdAndStatusOrderByLastSeenAtDesc(Long tenant,String status); }
++public interface IncidentRepository extends JpaRepository<IncidentEntity,Long>{ Optional<IncidentEntity> findFirstByTenantIdAndFingerprintAndStatusIn(String tenant,String fp,Collection<String> statuses); Optional<IncidentEntity> findByIdAndTenantId(Long id,String tenant); List<IncidentEntity> findByTenantIdOrderByLastSeenAtDesc(String tenant); List<IncidentEntity> findByTenantIdAndStatusOrderByLastSeenAtDesc(String tenant,String status); }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/repository/RuleRepository.java b/alert-service/src/main/java/com/logplatform/alert/repository/RuleRepository.java
+index 8e0848e..0e7cbc2 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/repository/RuleRepository.java
++++ b/alert-service/src/main/java/com/logplatform/alert/repository/RuleRepository.java
+@@ -1,3 +1,3 @@
+ package com.logplatform.alert.repository;
+ import com.logplatform.alert.domain.RuleEntity; import org.springframework.data.jpa.repository.JpaRepository; import java.util.List; import java.util.Optional;
+-public interface RuleRepository extends JpaRepository<RuleEntity,Long>{ List<RuleEntity> findByTenantIdAndEnabledTrue(Long tenantId); List<RuleEntity> findByTenantId(Long tenantId); Optional<RuleEntity> findByIdAndTenantId(Long id,Long tenantId); }
++public interface RuleRepository extends JpaRepository<RuleEntity,Long>{ List<RuleEntity> findByTenantIdAndEnabledTrue(String tenantId); List<RuleEntity> findByTenantId(String tenantId); Optional<RuleEntity> findByIdAndTenantId(Long id,String tenantId); }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/service/AlertEvaluationService.java b/alert-service/src/main/java/com/logplatform/alert/service/AlertEvaluationService.java
+index 5b55e11..b2a4f88 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/service/AlertEvaluationService.java
++++ b/alert-service/src/main/java/com/logplatform/alert/service/AlertEvaluationService.java
+@@ -36,7 +36,7 @@ public class AlertEvaluationService {
+ 
+     @Transactional
+     public void evaluate(ProcessedLogEvent e) {
+-        if (e == null || e.tenantId() <= 0 || e.eventId() == null || e.timestamp() == null || e.severity() == null)
++        if (e == null || e.tenantId() == null || e.tenantId().isBlank() || e.tenantId().length() > 36 || e.eventId() == null || e.timestamp() == null || e.severity() == null)
+             return;
+         for (RuleEntity rule : rules.findByTenantIdAndEnabledTrue(e.tenantId())) {
+             if (!matches(rule, e)) continue;
+diff --git a/alert-service/src/main/java/com/logplatform/alert/service/IncidentService.java b/alert-service/src/main/java/com/logplatform/alert/service/IncidentService.java
+index b6592f7..2c70a08 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/service/IncidentService.java
++++ b/alert-service/src/main/java/com/logplatform/alert/service/IncidentService.java
+@@ -1,9 +1,9 @@
+ package com.logplatform.alert.service;
+ import com.logplatform.alert.domain.IncidentEntity;import com.logplatform.alert.repository.IncidentRepository;import org.springframework.stereotype.Service;import org.springframework.transaction.annotation.Transactional;import java.time.Instant;import java.util.*;
+ @Service public class IncidentService {private final IncidentRepository repo;public IncidentService(IncidentRepository r){repo=r;}
+- @Transactional(readOnly=true) public List<IncidentEntity> list(long tenant,String status){return status==null?repo.findByTenantIdOrderByLastSeenAtDesc(tenant):repo.findByTenantIdAndStatusOrderByLastSeenAtDesc(tenant,status.toUpperCase());}
+- @Transactional(readOnly=true) public IncidentEntity get(long tenant,long id){return repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Incident not found"));}
+- @Transactional public IncidentEntity acknowledge(long tenant,long id,String actor){IncidentEntity i=get(tenant,id);i.acknowledge(actor);return i;}
+- @Transactional public IncidentEntity assign(long tenant,long id,String assignee){IncidentEntity i=get(tenant,id);i.assign(assignee);return i;}
+- @Transactional public IncidentEntity resolve(long tenant,long id){IncidentEntity i=get(tenant,id);i.resolve(Instant.now());return i;}
++ @Transactional(readOnly=true) public List<IncidentEntity> list(String tenant,String status){return status==null?repo.findByTenantIdOrderByLastSeenAtDesc(tenant):repo.findByTenantIdAndStatusOrderByLastSeenAtDesc(tenant,status.toUpperCase());}
++ @Transactional(readOnly=true) public IncidentEntity get(String tenant,long id){return repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Incident not found"));}
++ @Transactional public IncidentEntity acknowledge(String tenant,long id,String actor){IncidentEntity i=get(tenant,id);i.acknowledge(actor);return i;}
++ @Transactional public IncidentEntity assign(String tenant,long id,String assignee){IncidentEntity i=get(tenant,id);i.assign(assignee);return i;}
++ @Transactional public IncidentEntity resolve(String tenant,long id){IncidentEntity i=get(tenant,id);i.resolve(Instant.now());return i;}
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/service/RuleService.java b/alert-service/src/main/java/com/logplatform/alert/service/RuleService.java
+index 6d53c72..30a1630 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/service/RuleService.java
++++ b/alert-service/src/main/java/com/logplatform/alert/service/RuleService.java
+@@ -1,9 +1,9 @@
+ package com.logplatform.alert.service;
+ import com.logplatform.alert.domain.RuleEntity; import com.logplatform.alert.repository.RuleRepository; import com.logplatform.alert.web.RuleRequest; import org.springframework.stereotype.Service; import org.springframework.transaction.annotation.Transactional; import java.util.*;
+ @Service public class RuleService {private final RuleRepository repo;public RuleService(RuleRepository r){repo=r;}
+- @Transactional public RuleEntity create(long tenant,RuleRequest q){RuleEntity r=new RuleEntity();apply(r,q);r.setTenantId(tenant);return repo.save(r);}
+- @Transactional(readOnly=true) public List<RuleEntity> list(long tenant){return repo.findByTenantId(tenant);}
+- @Transactional public RuleEntity update(long tenant,long id,RuleRequest q){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));apply(r,q);return r;}
+- @Transactional public void delete(long tenant,long id){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));r.setEnabled(false);}
++ @Transactional public RuleEntity create(String tenant,RuleRequest q){RuleEntity r=new RuleEntity();apply(r,q);r.setTenantId(tenant);return repo.save(r);}
++ @Transactional(readOnly=true) public List<RuleEntity> list(String tenant){return repo.findByTenantId(tenant);}
++ @Transactional public RuleEntity update(String tenant,long id,RuleRequest q){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));apply(r,q);return r;}
++ @Transactional public void delete(String tenant,long id){RuleEntity r=repo.findByIdAndTenantId(id,tenant).orElseThrow(()->new NoSuchElementException("Alert rule not found"));r.setEnabled(false);}
+  private void apply(RuleEntity r,RuleRequest q){if(q.severity()!=null&&!Set.of("TRACE","DEBUG","INFO","WARN","ERROR","FATAL").contains(q.severity().toUpperCase()))throw new IllegalArgumentException("Unsupported severity");r.setName(q.name());r.setDescription(q.description());r.setSeverity(q.severity()==null?null:q.severity().toUpperCase());r.setServiceName(q.serviceName());r.setEnvironment(q.environment());r.setThresholdCount(q.thresholdCount());r.setWindowSeconds(q.windowSeconds());r.setCooldownSeconds(q.cooldownSeconds());r.setEnabled(q.enabled());}
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/service/SlidingWindowCounter.java b/alert-service/src/main/java/com/logplatform/alert/service/SlidingWindowCounter.java
+index 0abf235..8a40d26 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/service/SlidingWindowCounter.java
++++ b/alert-service/src/main/java/com/logplatform/alert/service/SlidingWindowCounter.java
+@@ -1,7 +1,7 @@
+ package com.logplatform.alert.service;
+-import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.data.redis.core.script.DefaultRedisScript; import org.springframework.stereotype.Component; import java.time.Instant; import java.util.List; import java.util.UUID;
++import org.springframework.data.redis.core.StringRedisTemplate; import org.springframework.data.redis.core.script.DefaultRedisScript; import org.springframework.stereotype.Component; import java.time.Instant; import java.util.List;
+ @Component public class SlidingWindowCounter {
+  private final StringRedisTemplate redis; private final DefaultRedisScript<Long> script;
+  public SlidingWindowCounter(StringRedisTemplate redis){this.redis=redis;this.script=new DefaultRedisScript<>();this.script.setResultType(Long.class);this.script.setScriptText("local k=KEYS[1]; local now=tonumber(ARGV[1]); local cutoff=now-tonumber(ARGV[2]); redis.call('ZREMRANGEBYSCORE',k,'-inf',cutoff); redis.call('ZADD',k,now,ARGV[3]); redis.call('PEXPIRE',k,tonumber(ARGV[2])*1000+5000); return redis.call('ZCARD',k)");}
+- public long addAndCount(String key,String eventId,Instant at,int windowSeconds){Long n=redis.execute(script,List.of(key),String.valueOf(at.toEpochMilli()),String.valueOf(windowSeconds*1000L),eventId+":"+UUID.randomUUID());return n==null?0:n;}
++ public long addAndCount(String key,String eventId,Instant at,int windowSeconds){Long n=redis.execute(script,List.of(key),String.valueOf(at.toEpochMilli()),String.valueOf(windowSeconds*1000L),eventId);return n==null?0:n;}
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/stream/PendingRecoveryJob.java b/alert-service/src/main/java/com/logplatform/alert/stream/PendingRecoveryJob.java
+new file mode 100644
+index 0000000..835db89
+--- /dev/null
++++ b/alert-service/src/main/java/com/logplatform/alert/stream/PendingRecoveryJob.java
+@@ -0,0 +1,76 @@
++package com.logplatform.alert.stream;
++
++import com.logplatform.alert.config.AlertProperties;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.data.domain.Range;
++import org.springframework.data.redis.connection.stream.*;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++import java.time.Duration;
++
++/**
++ * Re-delivers events that were read but never ACKed (service crashed, or evaluation failed because
++ * MySQL/Redis was briefly down). After app.alert.max-deliveries attempts the event goes to the DLQ.
++ */
++@Component
++public class PendingRecoveryJob {
++
++    private static final Logger log = LoggerFactory.getLogger(PendingRecoveryJob.class);
++    private static final int BATCH = 100;
++
++    private final StringRedisTemplate redis;
++    private final AlertProperties props;
++    private final ProcessedLogStreamConsumer consumer;
++
++    public PendingRecoveryJob(StringRedisTemplate redis, AlertProperties props, ProcessedLogStreamConsumer consumer) {
++        this.redis = redis;
++        this.props = props;
++        this.consumer = consumer;
++    }
++
++    @Scheduled(fixedDelayString = "${app.alert.recovery-delay-ms:15000}")
++    public void recover() {
++        try {
++            PendingMessages pending = redis.opsForStream().pending(
++                    props.processedStream(), props.consumerGroup(), Range.unbounded(), BATCH);
++            if (pending == null) return;
++
++            Duration idle = Duration.ofMillis(props.pendingIdleMs());
++            for (PendingMessage message : pending) {
++                if (message.getElapsedTimeSinceLastDelivery().compareTo(idle) < 0) continue;
++                recoverOne(message, idle);
++            }
++        } catch (Exception ex) {
++            log.error("Pending recovery failed: {}", ex.toString());
++        }
++    }
++
++    private void recoverOne(PendingMessage message, Duration idle) {
++        try {
++            long deliveries = message.getTotalDeliveryCount();
++
++            var claimed = redis.opsForStream().claim(
++                    props.processedStream(), props.consumerGroup(), props.consumerName(), idle, message.getId());
++
++            if (claimed == null || claimed.isEmpty()) {
++                // entry was deleted from the stream; it can never be processed, so clear it from the PEL
++                consumer.acknowledgeOnly(message.getId());
++                return;
++            }
++
++            for (MapRecord<String, Object, Object> rec : claimed) {
++                if (deliveries >= props.maxDeliveries()) {
++                    consumer.deadLetter(rec, "Gave up after " + deliveries + " delivery attempts");
++                } else {
++                    log.info("Retrying pending event {} (delivery {})", rec.getId().getValue(), deliveries + 1);
++                    consumer.processRecord(rec);
++                }
++            }
++        } catch (Exception ex) {
++            log.warn("Could not recover pending event {}: {}", message.getId(), ex.toString());
++        }
++    }
++}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/stream/ProcessedLogStreamConsumer.java b/alert-service/src/main/java/com/logplatform/alert/stream/ProcessedLogStreamConsumer.java
+index 4c00ed7..644aec4 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/stream/ProcessedLogStreamConsumer.java
++++ b/alert-service/src/main/java/com/logplatform/alert/stream/ProcessedLogStreamConsumer.java
+@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.logplatform.alert.config.AlertProperties;
+ import com.logplatform.alert.service.AlertEvaluationService;
+ import com.logplatform.common.ProcessedLogEvent;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.boot.context.event.ApplicationReadyEvent;
+ import org.springframework.context.event.EventListener;
+ import org.springframework.data.redis.connection.stream.*;
+@@ -14,9 +16,18 @@ import org.springframework.stereotype.Component;
+ import java.time.Duration;
+ import java.util.*;
+ 
++/**
++ * Reads logs.processed.
++ *  - Unparseable event (permanent)  -> logs.dlq + ACK immediately.
++ *  - Evaluation failure (transient: DB/Redis down...) -> left PENDING; PendingRecoveryJob retries it
++ *    and only dead-letters it after app.alert.max-deliveries attempts.
++ * Entries are XDEL'd after XACK so logs.processed does not grow forever (alert-service is its only consumer group).
++ */
+ @Component
+ public class ProcessedLogStreamConsumer {
+ 
++    private static final Logger log = LoggerFactory.getLogger(ProcessedLogStreamConsumer.class);
++
+     private final StringRedisTemplate redis;
+     private final AlertProperties props;
+     private final ObjectMapper mapper;
+@@ -69,75 +80,88 @@ public class ProcessedLogStreamConsumer {
+     public void poll() {
+         if (!groupReady) return;
+ 
+-        List<MapRecord<String, Object, Object>> records =
+-                redis.opsForStream().read(
+-                        Consumer.from(props.consumerGroup(), props.consumerName()),
+-                        StreamReadOptions.empty()
+-                                .count(20)
+-                                .block(Duration.ofMillis(500)),
+-                        StreamOffset.create(
+-                                props.processedStream(),
+-                                ReadOffset.lastConsumed()
+-                        )
+-                );
+-
+-        if (records == null) return;
+-
+-        for (var rec : records) {
+-            process(rec);
++        try {
++            List<MapRecord<String, Object, Object>> records =
++                    redis.opsForStream().read(
++                            Consumer.from(props.consumerGroup(), props.consumerName()),
++                            StreamReadOptions.empty()
++                                    .count(20)
++                                    .block(Duration.ofMillis(500)),
++                            StreamOffset.create(
++                                    props.processedStream(),
++                                    ReadOffset.lastConsumed()
++                            )
++                    );
++
++            if (records == null) return;
++
++            for (var rec : records) {
++                processRecord(rec);
++            }
++        } catch (Exception ex) {
++            log.error("Polling {} failed: {}", props.processedStream(), ex.toString());
+         }
+     }
+ 
+-    private void process(MapRecord<String, Object, Object> rec) {
++    /** Parse, evaluate, ACK. Also used by PendingRecoveryJob for retries. */
++    public void processRecord(MapRecord<String, Object, Object> rec) {
++        ProcessedLogEvent event;
+         try {
+-            Map<String, Object> m = new HashMap<>();
+-            rec.getValue().forEach(
+-                    (k, v) -> m.put(String.valueOf(k), v)
+-            );
+-
+-            ProcessedLogEvent event = mapper.readValue(
+-                    String.valueOf(m.get("payload")),
+-                    ProcessedLogEvent.class
+-            );
++            event = parse(rec);
++        } catch (Exception ex) {
++            deadLetter(rec, "Invalid event: " + ex.getMessage());
++            return;
++        }
+ 
++        try {
+             evaluator.evaluate(event);
++            acknowledgeAndDelete(rec.getId());
++        } catch (Exception ex) {
++            log.warn("Evaluation of {} failed, left pending for retry: {}",
++                    rec.getId().getValue(), ex.toString());
++        }
++    }
+ 
+-            redis.opsForStream().acknowledge(
+-                    props.processedStream(),
+-                    props.consumerGroup(),
+-                    rec.getId()
+-            );
++    private ProcessedLogEvent parse(MapRecord<String, Object, Object> rec) throws Exception {
++        Object payload = rec.getValue().get("payload");
++        if (payload == null) {
++            throw new IllegalArgumentException("missing payload field");
++        }
++        ProcessedLogEvent event = mapper.readValue(payload.toString(), ProcessedLogEvent.class);
++        if (event == null) {
++            throw new IllegalArgumentException("empty payload");
++        }
++        return event;
++    }
+ 
++    /** Copies the record to the DLQ and, only if that worked, ACKs the original. */
++    public void deadLetter(MapRecord<String, Object, Object> rec, String reason) {
++        try {
++            Map<String, String> dlq = new LinkedHashMap<>();
++            rec.getValue().forEach((k, v) -> dlq.put(String.valueOf(k), String.valueOf(v)));
++            dlq.put("sourceStream", props.processedStream());
++            dlq.put("sourceId", rec.getId().getValue());
++            dlq.put("error", reason == null ? "unknown" : reason);
++
++            redis.opsForStream().add(
++                    StreamRecords.newRecord()
++                            .in(props.deadLetterStream())
++                            .ofMap(dlq)
++            );
++            acknowledgeAndDelete(rec.getId());
++            log.warn("Dead-lettered {}: {}", rec.getId().getValue(), reason);
+         } catch (Exception ex) {
+-            try {
+-                Map<String, String> dlq = new LinkedHashMap<>();
+-
+-                dlq.put("sourceStream", props.processedStream());
+-                dlq.put("sourceId", rec.getId().getValue());
+-                dlq.put("error", String.valueOf(ex.getMessage()));
+-
+-                rec.getValue().forEach(
+-                        (k, v) -> dlq.put(
+-                                String.valueOf(k),
+-                                String.valueOf(v)
+-                        )
+-                );
+-
+-                redis.opsForStream().add(
+-                        StreamRecords.newRecord()
+-                                .in(props.deadLetterStream())
+-                                .ofMap(dlq)
+-                );
+-
+-                redis.opsForStream().acknowledge(
+-                        props.processedStream(),
+-                        props.consumerGroup(),
+-                        rec.getId()
+-                );
+-
+-            } catch (Exception ignored) {
+-                /* leave pending for redelivery */
+-            }
++            log.error("DLQ write failed for {}, left pending: {}", rec.getId().getValue(), ex.toString());
+         }
+     }
++
++    public void acknowledgeAndDelete(RecordId id) {
++        redis.opsForStream().acknowledge(props.processedStream(), props.consumerGroup(), id);
++        redis.opsForStream().delete(props.processedStream(), id);
++    }
++
++    /** For pending ids whose stream entry no longer exists: nothing to retry, just clear the PEL. */
++    public void acknowledgeOnly(RecordId id) {
++        redis.opsForStream().acknowledge(props.processedStream(), props.consumerGroup(), id);
++    }
+ }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java b/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
+index 1843476..fa07083 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/AlertRuleController.java
+@@ -1,7 +1,7 @@
+ package com.logplatform.alert.web;
+ import com.logplatform.alert.service.RuleService;import jakarta.validation.Valid;import org.springframework.http.HttpStatus;import org.springframework.web.bind.annotation.*;import java.util.*;
+ @RestController @RequestMapping("/api/v1/alert-rules") public class AlertRuleController {private final RuleService service;public AlertRuleController(RuleService s){service=s;}
+- private long tenant(String h){try{return Long.parseLong(h);}catch(Exception e){throw new IllegalArgumentException("Missing or invalid trusted X-Tenant-Id");}}
++ private String tenant(String h){return TenantHeader.require(h);}
+  @PostMapping @ResponseStatus(HttpStatus.CREATED) public RuleResponse create(@RequestHeader("X-Tenant-Id") String t,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.create(tenant(t),q));}
+  @GetMapping public List<RuleResponse> list(@RequestHeader("X-Tenant-Id") String t){return service.list(tenant(t)).stream().map(RuleResponse::from).toList();}
+  @PutMapping("/{id}") public RuleResponse update(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id,@Valid @RequestBody RuleRequest q){return RuleResponse.from(service.update(tenant(t),id,q));}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java b/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
+index 51eedd9..e827d54 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/IncidentController.java
+@@ -1,7 +1,7 @@
+ package com.logplatform.alert.web;
+ import com.logplatform.alert.service.IncidentService;import jakarta.validation.Valid;import org.springframework.web.bind.annotation.*;import java.util.*;
+ @RestController @RequestMapping("/api/v1/incidents") public class IncidentController {private final IncidentService service;public IncidentController(IncidentService s){service=s;}
+- private long tenant(String h){try{return Long.parseLong(h);}catch(Exception e){throw new IllegalArgumentException("Missing or invalid trusted X-Tenant-Id");}}
++ private String tenant(String h){return TenantHeader.require(h);}
+  @GetMapping public List<IncidentResponse> list(@RequestHeader("X-Tenant-Id") String t,@RequestParam(required=false) String status){return service.list(tenant(t),status).stream().map(IncidentResponse::from).toList();}
+  @GetMapping("/{id}") public IncidentResponse get(@RequestHeader("X-Tenant-Id") String t,@PathVariable long id){return IncidentResponse.from(service.get(tenant(t),id));}
+  @PostMapping("/{id}/acknowledge") public IncidentResponse acknowledge(@RequestHeader("X-Tenant-Id") String t,@RequestHeader(value="X-User-Id",defaultValue="system") String actor,@PathVariable long id){return IncidentResponse.from(service.acknowledge(tenant(t),id,actor));}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/IncidentResponse.java b/alert-service/src/main/java/com/logplatform/alert/web/IncidentResponse.java
+index 46b62b9..7297080 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/IncidentResponse.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/IncidentResponse.java
+@@ -1,3 +1,3 @@
+ package com.logplatform.alert.web;
+ import com.logplatform.alert.domain.IncidentEntity; import java.time.Instant;
+-public record IncidentResponse(Long id,Long tenantId,Long ruleId,String fingerprint,String status,String title,String description,Instant firstSeenAt,Instant lastSeenAt,long occurrenceCount,String acknowledgedBy,String assignedTo,Instant resolvedAt){public static IncidentResponse from(IncidentEntity i){return new IncidentResponse(i.getId(),i.getTenantId(),i.getRuleId(),i.getFingerprint(),i.getStatus(),i.getTitle(),i.getDescription(),i.getFirstSeenAt(),i.getLastSeenAt(),i.getOccurrenceCount(),i.getAcknowledgedBy(),i.getAssignedTo(),i.getResolvedAt());}}
++public record IncidentResponse(Long id,String tenantId,Long ruleId,String fingerprint,String status,String title,String description,Instant firstSeenAt,Instant lastSeenAt,long occurrenceCount,String acknowledgedBy,String assignedTo,Instant resolvedAt){public static IncidentResponse from(IncidentEntity i){return new IncidentResponse(i.getId(),i.getTenantId(),i.getRuleId(),i.getFingerprint(),i.getStatus(),i.getTitle(),i.getDescription(),i.getFirstSeenAt(),i.getLastSeenAt(),i.getOccurrenceCount(),i.getAcknowledgedBy(),i.getAssignedTo(),i.getResolvedAt());}}
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/RuleResponse.java b/alert-service/src/main/java/com/logplatform/alert/web/RuleResponse.java
+index 04a64b6..b0ac048 100644
+--- a/alert-service/src/main/java/com/logplatform/alert/web/RuleResponse.java
++++ b/alert-service/src/main/java/com/logplatform/alert/web/RuleResponse.java
+@@ -1,3 +1,3 @@
+ package com.logplatform.alert.web;
+ import com.logplatform.alert.domain.RuleEntity;
+-public record RuleResponse(Long id,Long tenantId,String name,String description,String severity,String serviceName,String environment,int thresholdCount,int windowSeconds,int cooldownSeconds,boolean enabled){ public static RuleResponse from(RuleEntity r){return new RuleResponse(r.getId(),r.getTenantId(),r.getName(),r.getDescription(),r.getSeverity(),r.getServiceName(),r.getEnvironment(),r.getThresholdCount(),r.getWindowSeconds(),r.getCooldownSeconds(),r.isEnabled());} }
++public record RuleResponse(Long id,String tenantId,String name,String description,String severity,String serviceName,String environment,int thresholdCount,int windowSeconds,int cooldownSeconds,boolean enabled){ public static RuleResponse from(RuleEntity r){return new RuleResponse(r.getId(),r.getTenantId(),r.getName(),r.getDescription(),r.getSeverity(),r.getServiceName(),r.getEnvironment(),r.getThresholdCount(),r.getWindowSeconds(),r.getCooldownSeconds(),r.isEnabled());} }
+diff --git a/alert-service/src/main/java/com/logplatform/alert/web/TenantHeader.java b/alert-service/src/main/java/com/logplatform/alert/web/TenantHeader.java
+new file mode 100644
+index 0000000..ed644b2
+--- /dev/null
++++ b/alert-service/src/main/java/com/logplatform/alert/web/TenantHeader.java
+@@ -0,0 +1,17 @@
++package com.logplatform.alert.web;
++
++import java.util.regex.Pattern;
++
++/** Validates the X-Tenant-Id header injected by the gateway. Tenant ids are UUID strings (identity-service). */
++final class TenantHeader {
++    private static final Pattern VALID = Pattern.compile("^[A-Za-z0-9-]{1,36}$");
++
++    private TenantHeader() {}
++
++    static String require(String header) {
++        if (header == null || !VALID.matcher(header.trim()).matches()) {
++            throw new IllegalArgumentException("Missing or invalid trusted X-Tenant-Id");
++        }
++        return header.trim();
++    }
++}
+diff --git a/alert-service/src/main/resources/application.yml b/alert-service/src/main/resources/application.yml
+index a64bf90..9f3d27f 100644
+--- a/alert-service/src/main/resources/application.yml
++++ b/alert-service/src/main/resources/application.yml
+@@ -30,6 +30,9 @@ app:
+     window-key-prefix: "alert:window:"
+     cooldown-seconds: ${ALERT_COOLDOWN_SECONDS:300}
+     notification-stream: ${NOTIFICATIONS_OUT_STREAM:notifications.out}
++    pending-idle-ms: ${ALERT_PENDING_IDLE_MS:60000}   # a failed event is retried after this long
++    max-deliveries: ${ALERT_MAX_DELIVERIES:5}          # then it goes to the DLQ
++    recovery-delay-ms: ${ALERT_RECOVERY_DELAY_MS:15000}
+ management:
+   endpoints:
+     web:
+diff --git a/alert-service/src/main/resources/db/migration/V2__tenant_uuid_and_active_fingerprint.sql b/alert-service/src/main/resources/db/migration/V2__tenant_uuid_and_active_fingerprint.sql
+new file mode 100644
+index 0000000..94e75df
+--- /dev/null
++++ b/alert-service/src/main/resources/db/migration/V2__tenant_uuid_and_active_fingerprint.sql
+@@ -0,0 +1,24 @@
++-- V2
++-- 1) Tenant ids are UUID strings (identity-service), not BIGINT.
++-- 2) A fingerprint must be resolvable many times. The old unique key (tenant_id, fingerprint, status)
++--    allowed only ONE RESOLVED incident per fingerprint, so the 2nd resolve failed with a 500.
++--    active_fingerprint = fingerprint while OPEN/ACKNOWLEDGED and NULL once RESOLVED;
++--    MySQL allows many NULLs in a unique index, so only one *active* incident per fingerprint exists.
++
++ALTER TABLE incidents DROP INDEX uk_incident_active_fingerprint;
++
++ALTER TABLE alert_rules         MODIFY tenant_id VARCHAR(36) NOT NULL;
++ALTER TABLE incidents           MODIFY tenant_id VARCHAR(36) NOT NULL;
++ALTER TABLE notification_outbox MODIFY tenant_id VARCHAR(36) NOT NULL;
++
++ALTER TABLE incidents ADD COLUMN active_fingerprint VARCHAR(128) NULL;
++
++-- keep only the newest active incident per fingerprint so the unique key can be created
++UPDATE incidents i
++JOIN (SELECT MAX(id) AS mid
++        FROM incidents
++       WHERE status IN ('OPEN','ACKNOWLEDGED')
++       GROUP BY tenant_id, fingerprint) m ON i.id = m.mid
++   SET i.active_fingerprint = i.fingerprint;
++
++ALTER TABLE incidents ADD UNIQUE KEY uk_incident_active (tenant_id, active_fingerprint);
+diff --git a/alert-service/src/test/java/com/logplatform/alert/domain/IncidentEntityTest.java b/alert-service/src/test/java/com/logplatform/alert/domain/IncidentEntityTest.java
+new file mode 100644
+index 0000000..78f9a96
+--- /dev/null
++++ b/alert-service/src/test/java/com/logplatform/alert/domain/IncidentEntityTest.java
+@@ -0,0 +1,43 @@
++package com.logplatform.alert.domain;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.Instant;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++class IncidentEntityTest {
++
++    private IncidentEntity incident() {
++        return new IncidentEntity("4f1c9d7e-1111-2222-3333-444455556666", 1L, "fp", "title", "desc", Instant.now());
++    }
++
++    @Test
++    void activeIncidentHoldsItsFingerprintAsActiveKey() {
++        assertEquals("fp", incident().getActiveFingerprint());
++    }
++
++    @Test
++    void acknowledgedIncidentIsStillActive() {
++        IncidentEntity i = incident();
++        i.acknowledge("kalpesh");
++        assertEquals("fp", i.getActiveFingerprint());
++    }
++
++    @Test
++    void resolvingClearsActiveKeySoTheSameFingerprintCanBeResolvedAgain() {
++        IncidentEntity first = incident();
++        first.resolve(Instant.now());
++        IncidentEntity second = incident();
++        second.resolve(Instant.now());
++
++        assertNull(first.getActiveFingerprint());
++        assertNull(second.getActiveFingerprint());
++        assertEquals("RESOLVED", second.getStatus());
++    }
++
++    @Test
++    void tenantIdKeepsUuidString() {
++        assertEquals("4f1c9d7e-1111-2222-3333-444455556666", incident().getTenantId());
++    }
++}
+diff --git a/alert-service/src/test/java/com/logplatform/alert/service/AlertEvaluationServiceTest.java b/alert-service/src/test/java/com/logplatform/alert/service/AlertEvaluationServiceTest.java
+index 8636811..d875b35 100644
+--- a/alert-service/src/test/java/com/logplatform/alert/service/AlertEvaluationServiceTest.java
++++ b/alert-service/src/test/java/com/logplatform/alert/service/AlertEvaluationServiceTest.java
+@@ -49,7 +49,9 @@ class AlertEvaluationServiceTest {
+                 1000L,
+                 "alert:window:",
+                 300L,
+-                "notifications.out"
++                "notifications.out",
++                60000L,
++                5
+         );
+ 
+         evaluator = new AlertEvaluationService(
+@@ -66,7 +68,7 @@ class AlertEvaluationServiceTest {
+ 
+     @Test
+     void eventWithInvalidTenantIsIgnored() {
+-        ProcessedLogEvent event = event(0L);
++        ProcessedLogEvent event = event("");
+ 
+         evaluator.evaluate(event);
+ 
+@@ -76,10 +78,10 @@ class AlertEvaluationServiceTest {
+     @Test
+     void belowThresholdDoesNotCreateIncidentOrOutbox() {
+         RuleEntity rule = matchingRule();
+-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
++        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(4L);
+ 
+-        evaluator.evaluate(event(42L));
++        evaluator.evaluate(event("tenant-42"));
+ 
+         verify(counter).addAndCount(anyString(), eq("event-1"), eq(eventTime), eq(60));
+         verify(incidents, never()).save(any(IncidentEntity.class));
+@@ -89,25 +91,25 @@ class AlertEvaluationServiceTest {
+     @Test
+     void reachingThresholdCreatesIncidentAndNotificationOutbox() {
+         RuleEntity rule = matchingRule();
+-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
++        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
+         when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(
+-                eq(42L), anyString(), anyList()
++                eq("tenant-42"), anyString(), anyList()
+         )).thenReturn(Optional.empty());
+         when(incidents.save(any(IncidentEntity.class)))
+                 .thenAnswer(invocation -> invocation.getArgument(0));
+ 
+-        evaluator.evaluate(event(42L));
++        evaluator.evaluate(event("tenant-42"));
+ 
+         verify(incidents).save(argThat(incident ->
+-                incident.getTenantId().equals(42L)
++                incident.getTenantId().equals("tenant-42")
+                         && incident.getRuleId().equals(11L)
+                         && incident.getStatus().equals("OPEN")
+                         && incident.getTitle().equals("Payment API errors")
+         ));
+         verify(outbox).save(argThat(notification ->
+-                notification.getTenantId() == 42L
+-                        && notification.getEventKey().startsWith("incident-created:42:")
++                notification.getTenantId().equals("tenant-42")
++                        && notification.getEventKey().startsWith("incident-created:tenant-42:")
+                         && notification.getPayload().contains("\"incidentId\"")
+         ));
+     }
+@@ -116,16 +118,16 @@ class AlertEvaluationServiceTest {
+     void matchingActiveIncidentIsTouchedInsteadOfCreatingAnotherIncident() {
+         RuleEntity rule = matchingRule();
+         IncidentEntity active = new IncidentEntity(
+-                42L, 11L, "fingerprint", "Payment API errors", "existing incident", eventTime
++                "tenant-42", 11L, "fingerprint", "Payment API errors", "existing incident", eventTime
+         );
+ 
+-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
++        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+         when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
+         when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(
+-                eq(42L), anyString(), anyList()
++                eq("tenant-42"), anyString(), anyList()
+         )).thenReturn(Optional.of(active));
+ 
+-        evaluator.evaluate(event(42L));
++        evaluator.evaluate(event("tenant-42"));
+ 
+         assertEquals(2L, active.getOccurrenceCount());
+         assertEquals(eventTime, active.getLastSeenAt());
+@@ -137,9 +139,9 @@ class AlertEvaluationServiceTest {
+     void nonMatchingRuleDoesNotIncrementCounter() {
+         RuleEntity rule = matchingRule();
+         rule.setServiceName("different-service");
+-        when(rules.findByTenantIdAndEnabledTrue(42L)).thenReturn(List.of(rule));
++        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+ 
+-        evaluator.evaluate(event(42L));
++        evaluator.evaluate(event("tenant-42"));
+ 
+         verifyNoInteractions(counter);
+         verify(incidents, never()).save(any(IncidentEntity.class));
+@@ -148,7 +150,7 @@ class AlertEvaluationServiceTest {
+     private RuleEntity matchingRule() {
+         RuleEntity rule = new RuleEntity();
+         ReflectionTestUtils.setField(rule, "id", 11L);
+-        rule.setTenantId(42L);
++        rule.setTenantId("tenant-42");
+         rule.setName("Payment API errors");
+         rule.setSeverity("ERROR");
+         rule.setServiceName("payment-api");
+@@ -160,7 +162,7 @@ class AlertEvaluationServiceTest {
+         return rule;
+     }
+ 
+-    private ProcessedLogEvent event(long tenantId) {
++    private ProcessedLogEvent event(String tenantId) {
+         return new ProcessedLogEvent(
+                 "event-1",
+                 tenantId,
+diff --git a/alert-service/src/test/java/com/logplatform/alert/service/IncidentServiceTest.java b/alert-service/src/test/java/com/logplatform/alert/service/IncidentServiceTest.java
+index 130c798..146477a 100644
+--- a/alert-service/src/test/java/com/logplatform/alert/service/IncidentServiceTest.java
++++ b/alert-service/src/test/java/com/logplatform/alert/service/IncidentServiceTest.java
+@@ -27,45 +27,45 @@ class IncidentServiceTest {
+     @Test
+     void listReturnsAllIncidentsForTenantWhenStatusIsNull() {
+         List<IncidentEntity> expected = List.of(incident(), incident());
+-        when(repo.findByTenantIdOrderByLastSeenAtDesc(42L)).thenReturn(expected);
++        when(repo.findByTenantIdOrderByLastSeenAtDesc("tenant-42")).thenReturn(expected);
+ 
+-        List<IncidentEntity> result = service.list(42L, null);
++        List<IncidentEntity> result = service.list("tenant-42", null);
+ 
+         assertSame(expected, result);
+-        verify(repo).findByTenantIdOrderByLastSeenAtDesc(42L);
+-        verify(repo, never()).findByTenantIdAndStatusOrderByLastSeenAtDesc(anyLong(), anyString());
++        verify(repo).findByTenantIdOrderByLastSeenAtDesc("tenant-42");
++        verify(repo, never()).findByTenantIdAndStatusOrderByLastSeenAtDesc(anyString(), anyString());
+     }
+ 
+     @Test
+     void listNormalizesStatusToUppercase() {
+         List<IncidentEntity> expected = List.of(incident());
+-        when(repo.findByTenantIdAndStatusOrderByLastSeenAtDesc(42L, "ACKNOWLEDGED"))
++        when(repo.findByTenantIdAndStatusOrderByLastSeenAtDesc("tenant-42", "ACKNOWLEDGED"))
+                 .thenReturn(expected);
+ 
+-        List<IncidentEntity> result = service.list(42L, "acknowledged");
++        List<IncidentEntity> result = service.list("tenant-42", "acknowledged");
+ 
+         assertSame(expected, result);
+-        verify(repo).findByTenantIdAndStatusOrderByLastSeenAtDesc(42L, "ACKNOWLEDGED");
++        verify(repo).findByTenantIdAndStatusOrderByLastSeenAtDesc("tenant-42", "ACKNOWLEDGED");
+     }
+ 
+     @Test
+     void getReturnsIncidentBelongingToTenant() {
+         IncidentEntity expected = incident();
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(expected));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(expected));
+ 
+-        IncidentEntity result = service.get(42L, 7L);
++        IncidentEntity result = service.get("tenant-42", 7L);
+ 
+         assertSame(expected, result);
+-        verify(repo).findByIdAndTenantId(7L, 42L);
++        verify(repo).findByIdAndTenantId(7L, "tenant-42");
+     }
+ 
+     @Test
+     void getThrowsWhenIncidentDoesNotBelongToTenantOrDoesNotExist() {
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
+ 
+         NoSuchElementException exception = assertThrows(
+                 NoSuchElementException.class,
+-                () -> service.get(42L, 7L)
++                () -> service.get("tenant-42", 7L)
+         );
+ 
+         assertEquals("Incident not found", exception.getMessage());
+@@ -74,9 +74,9 @@ class IncidentServiceTest {
+     @Test
+     void acknowledgeChangesOpenIncidentToAcknowledged() {
+         IncidentEntity incident = incident();
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+-        IncidentEntity result = service.acknowledge(42L, 7L, "admin-user");
++        IncidentEntity result = service.acknowledge("tenant-42", 7L, "admin-user");
+ 
+         assertSame(incident, result);
+         assertEquals("ACKNOWLEDGED", result.getStatus());
+@@ -87,11 +87,11 @@ class IncidentServiceTest {
+     void acknowledgeRejectsIncidentThatIsNotOpen() {
+         IncidentEntity incident = incident();
+         incident.acknowledge("first-admin");
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+         assertThrows(
+                 IllegalStateException.class,
+-                () -> service.acknowledge(42L, 7L, "second-admin")
++                () -> service.acknowledge("tenant-42", 7L, "second-admin")
+         );
+ 
+         assertEquals("ACKNOWLEDGED", incident.getStatus());
+@@ -101,9 +101,9 @@ class IncidentServiceTest {
+     @Test
+     void assignUpdatesAssignee() {
+         IncidentEntity incident = incident();
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+-        IncidentEntity result = service.assign(42L, 7L, "on-call-engineer");
++        IncidentEntity result = service.assign("tenant-42", 7L, "on-call-engineer");
+ 
+         assertSame(incident, result);
+         assertEquals("on-call-engineer", result.getAssignedTo());
+@@ -113,11 +113,11 @@ class IncidentServiceTest {
+     void assignRejectsResolvedIncident() {
+         IncidentEntity incident = incident();
+         incident.resolve(Instant.parse("2026-11-14T06:00:00Z"));
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+         assertThrows(
+                 IllegalStateException.class,
+-                () -> service.assign(42L, 7L, "on-call-engineer")
++                () -> service.assign("tenant-42", 7L, "on-call-engineer")
+         );
+ 
+         assertNull(incident.getAssignedTo());
+@@ -126,9 +126,9 @@ class IncidentServiceTest {
+     @Test
+     void resolveChangesIncidentToResolved() {
+         IncidentEntity incident = incident();
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+-        IncidentEntity result = service.resolve(42L, 7L);
++        IncidentEntity result = service.resolve("tenant-42", 7L);
+ 
+         assertSame(incident, result);
+         assertEquals("RESOLVED", result.getStatus());
+@@ -140,9 +140,9 @@ class IncidentServiceTest {
+         IncidentEntity incident = incident();
+         Instant originalResolvedAt = Instant.parse("2026-11-14T06:00:00Z");
+         incident.resolve(originalResolvedAt);
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(incident));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(incident));
+ 
+-        IncidentEntity result = service.resolve(42L, 7L);
++        IncidentEntity result = service.resolve("tenant-42", 7L);
+ 
+         assertSame(incident, result);
+         assertEquals("RESOLVED", result.getStatus());
+@@ -152,7 +152,7 @@ class IncidentServiceTest {
+     private IncidentEntity incident() {
+         Instant now = Instant.parse("2026-11-14T05:00:00Z");
+         return new IncidentEntity(
+-                42L,
++                "tenant-42",
+                 3L,
+                 "fingerprint-123",
+                 "Payment API errors",
+diff --git a/alert-service/src/test/java/com/logplatform/alert/service/RuleServiceTest.java b/alert-service/src/test/java/com/logplatform/alert/service/RuleServiceTest.java
+index c127d2c..dce0714 100644
+--- a/alert-service/src/test/java/com/logplatform/alert/service/RuleServiceTest.java
++++ b/alert-service/src/test/java/com/logplatform/alert/service/RuleServiceTest.java
+@@ -30,9 +30,9 @@ class RuleServiceTest {
+         when(repo.save(any(RuleEntity.class)))
+                 .thenAnswer(invocation -> invocation.getArgument(0));
+ 
+-        RuleEntity result = service.create(42L, request);
++        RuleEntity result = service.create("tenant-42", request);
+ 
+-        assertEquals(42L, result.getTenantId());
++        assertEquals("tenant-42", result.getTenantId());
+         assertEquals("Payment errors", result.getName());
+         assertEquals("ERROR", result.getSeverity());
+         assertTrue(result.isEnabled());
+@@ -42,21 +42,21 @@ class RuleServiceTest {
+     @Test
+     void listReturnsRulesForTenant() {
+         List<RuleEntity> expected = List.of(new RuleEntity(), new RuleEntity());
+-        when(repo.findByTenantId(42L)).thenReturn(expected);
++        when(repo.findByTenantId("tenant-42")).thenReturn(expected);
+ 
+-        List<RuleEntity> result = service.list(42L);
++        List<RuleEntity> result = service.list("tenant-42");
+ 
+         assertSame(expected, result);
+-        verify(repo).findByTenantId(42L);
++        verify(repo).findByTenantId("tenant-42");
+     }
+ 
+     @Test
+     void updateChangesRuleFieldsAndNormalizesSeverity() {
+         RuleEntity existing = new RuleEntity();
+-        existing.setTenantId(42L);
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(existing));
++        existing.setTenantId("tenant-42");
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(existing));
+ 
+-        RuleEntity result = service.update(42L, 7L,
++        RuleEntity result = service.update("tenant-42", 7L,
+                 new RuleRequest("Updated rule", "Updated description", "warn",
+                         "billing-api", "production", 10, 120, 30, true));
+ 
+@@ -74,11 +74,11 @@ class RuleServiceTest {
+ 
+     @Test
+     void updateThrowsWhenRuleDoesNotBelongToTenantOrDoesNotExist() {
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
+ 
+         NoSuchElementException exception = assertThrows(
+                 NoSuchElementException.class,
+-                () -> service.update(42L, 7L, request("Rule", "ERROR", true))
++                () -> service.update("tenant-42", 7L, request("Rule", "ERROR", true))
+         );
+ 
+         assertEquals("Alert rule not found", exception.getMessage());
+@@ -89,9 +89,9 @@ class RuleServiceTest {
+     void deleteSoftDisablesRuleInsteadOfDeletingIt() {
+         RuleEntity existing = new RuleEntity();
+         existing.setEnabled(true);
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.of(existing));
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.of(existing));
+ 
+-        service.delete(42L, 7L);
++        service.delete("tenant-42", 7L);
+ 
+         assertFalse(existing.isEnabled());
+         verify(repo, never()).delete(any(RuleEntity.class));
+@@ -99,11 +99,11 @@ class RuleServiceTest {
+ 
+     @Test
+     void deleteThrowsWhenRuleDoesNotBelongToTenantOrDoesNotExist() {
+-        when(repo.findByIdAndTenantId(7L, 42L)).thenReturn(Optional.empty());
++        when(repo.findByIdAndTenantId(7L, "tenant-42")).thenReturn(Optional.empty());
+ 
+         NoSuchElementException exception = assertThrows(
+                 NoSuchElementException.class,
+-                () -> service.delete(42L, 7L)
++                () -> service.delete("tenant-42", 7L)
+         );
+ 
+         assertEquals("Alert rule not found", exception.getMessage());
+@@ -113,7 +113,7 @@ class RuleServiceTest {
+     void createRejectsUnsupportedSeverity() {
+         RuleRequest request = request("Payment errors", "URGENT", true);
+ 
+-        assertThrows(IllegalArgumentException.class, () -> service.create(42L, request));
++        assertThrows(IllegalArgumentException.class, () -> service.create("tenant-42", request));
+ 
+         verify(repo, never()).save(any(RuleEntity.class));
+     }
+@@ -123,7 +123,7 @@ class RuleServiceTest {
+         when(repo.save(any(RuleEntity.class)))
+                 .thenAnswer(invocation -> invocation.getArgument(0));
+ 
+-        RuleEntity result = service.create(42L, request("All severities", null, true));
++        RuleEntity result = service.create("tenant-42", request("All severities", null, true));
+ 
+         assertNull(result.getSeverity());
+         verify(repo).save(any(RuleEntity.class));
+diff --git a/alert-service/src/test/java/com/logplatform/alert/web/TenantHeaderTest.java b/alert-service/src/test/java/com/logplatform/alert/web/TenantHeaderTest.java
+new file mode 100644
+index 0000000..f93c0e5
+--- /dev/null
++++ b/alert-service/src/test/java/com/logplatform/alert/web/TenantHeaderTest.java
+@@ -0,0 +1,24 @@
++package com.logplatform.alert.web;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++class TenantHeaderTest {
++
++    @Test
++    void acceptsUuidAndNumericTenantIds() {
++        assertEquals("4f1c9d7e-1111-2222-3333-444455556666",
++                TenantHeader.require("4f1c9d7e-1111-2222-3333-444455556666"));
++        assertEquals("42", TenantHeader.require(" 42 "));
++    }
++
++    @Test
++    void rejectsMissingBlankOrSuspiciousValues() {
++        assertThrows(IllegalArgumentException.class, () -> TenantHeader.require(null));
++        assertThrows(IllegalArgumentException.class, () -> TenantHeader.require(""));
++        assertThrows(IllegalArgumentException.class, () -> TenantHeader.require("a b"));
++        assertThrows(IllegalArgumentException.class, () -> TenantHeader.require("x'; DROP TABLE incidents;--"));
++        assertThrows(IllegalArgumentException.class, () -> TenantHeader.require("a".repeat(37)));
++    }
++}
+diff --git a/common-core/src/main/java/com/logplatform/common/ProcessedLogEvent.java b/common-core/src/main/java/com/logplatform/common/ProcessedLogEvent.java
+index 0c08eb5..bd7666a 100644
+--- a/common-core/src/main/java/com/logplatform/common/ProcessedLogEvent.java
++++ b/common-core/src/main/java/com/logplatform/common/ProcessedLogEvent.java
+@@ -7,7 +7,7 @@ import java.time.Instant;
+  */
+ public record ProcessedLogEvent(
+         String eventId,
+-        long tenantId,
++        String tenantId,
+         Instant timestamp,
+         String service,
+         String environment,

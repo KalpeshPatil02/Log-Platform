@@ -136,6 +136,65 @@ class AlertEvaluationServiceTest {
     }
 
     @Test
+    void recentlyResolvedIncidentBlocksReopeningDuringCooldown() {
+        RuleEntity rule = matchingRule();   // cooldown 300 s
+        IncidentEntity resolved = new IncidentEntity(
+                "tenant-42", 11L, "fingerprint", "Payment API errors", "old incident", eventTime);
+        resolved.resolve(Instant.now().minusSeconds(10));
+
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+        when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
+        when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(eq("tenant-42"), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(incidents.findFirstByTenantIdAndFingerprintAndStatusOrderByResolvedAtDesc(
+                eq("tenant-42"), anyString(), eq("RESOLVED"))).thenReturn(Optional.of(resolved));
+
+        evaluator.evaluate(event("tenant-42"));
+
+        verify(incidents, never()).save(any(IncidentEntity.class));
+        verify(outbox, never()).save(any());
+    }
+
+    @Test
+    void incidentReopensAfterCooldownHasPassed() {
+        RuleEntity rule = matchingRule();   // cooldown 300 s
+        IncidentEntity resolved = new IncidentEntity(
+                "tenant-42", 11L, "fingerprint", "Payment API errors", "old incident", eventTime);
+        resolved.resolve(Instant.now().minusSeconds(400));
+
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+        when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
+        when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(eq("tenant-42"), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(incidents.findFirstByTenantIdAndFingerprintAndStatusOrderByResolvedAtDesc(
+                eq("tenant-42"), anyString(), eq("RESOLVED"))).thenReturn(Optional.of(resolved));
+        when(incidents.save(any(IncidentEntity.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        evaluator.evaluate(event("tenant-42"));
+
+        verify(incidents).save(any(IncidentEntity.class));
+        verify(outbox).save(any());
+    }
+
+    @Test
+    void zeroCooldownNeverChecksResolvedIncidents() {
+        RuleEntity rule = matchingRule();
+        rule.setCooldownSeconds(0);
+
+        when(rules.findByTenantIdAndEnabledTrue("tenant-42")).thenReturn(List.of(rule));
+        when(counter.addAndCount(anyString(), anyString(), any(Instant.class), anyInt())).thenReturn(5L);
+        when(incidents.findFirstByTenantIdAndFingerprintAndStatusIn(eq("tenant-42"), anyString(), anyList()))
+                .thenReturn(Optional.empty());
+        when(incidents.save(any(IncidentEntity.class))).thenAnswer(invocation -> invocation.getArgument(0));
+
+        evaluator.evaluate(event("tenant-42"));
+
+        verify(incidents, never()).findFirstByTenantIdAndFingerprintAndStatusOrderByResolvedAtDesc(
+                anyString(), anyString(), anyString());
+        verify(incidents).save(any(IncidentEntity.class));
+    }
+
+    @Test
     void nonMatchingRuleDoesNotIncrementCounter() {
         RuleEntity rule = matchingRule();
         rule.setServiceName("different-service");

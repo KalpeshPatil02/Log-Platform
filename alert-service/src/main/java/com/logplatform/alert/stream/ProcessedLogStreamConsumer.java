@@ -148,6 +148,7 @@ public class ProcessedLogStreamConsumer {
                             .in(props.deadLetterStream())
                             .ofMap(dlq)
             );
+            redis.opsForStream().trim(props.deadLetterStream(), 10000L);
             acknowledgeAndDelete(rec.getId());
             log.warn("Dead-lettered {}: {}", rec.getId().getValue(), reason);
         } catch (Exception ex) {

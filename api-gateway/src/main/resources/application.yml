@@ -46,7 +46,20 @@ spring:
         - id: ingestion-api
           uri: ${INGESTION_URL:http://localhost:8083}
           predicates:
-            - Path=/api/v1/logs/**
+            - Path=/api/v1/logs
+            - Method=POST
+
+        # Phase 5: Log query (JWT-authenticated)
+        - id: query-service-search
+          uri: ${QUERY_URL:http://localhost:8085}
+          predicates:
+            - Path=/api/v1/logs
+            - Method=GET
+        - id: query-service-get
+          uri: ${QUERY_URL:http://localhost:8085}
+          predicates:
+            - Path=/api/v1/logs/{eventId}
+            - Method=GET
 
         # There is deliberately NO route for /internal/** - it must never be reachable from outside.
         

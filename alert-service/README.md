@@ -65,3 +65,7 @@ The gateway copies the JWT `roles` claim into `X-User-Roles`; alert-service enfo
 | List/get rules and incidents | yes | yes | yes | yes |
 | Create/update/delete rules | no | yes | yes | no |
 | Acknowledge/assign/resolve incidents | no | yes | yes | no |
+
+## Cooldown
+
+`cooldownSeconds` on a rule: after an incident is RESOLVED, the same alert (same rule, service, environment and severity) will not open a new incident until `resolved_at + cooldownSeconds` has passed. Events keep being counted during the cooldown. `0` disables it.

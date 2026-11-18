@@ -50,6 +50,8 @@ public class AlertEvaluationService {
                 incident.touch(e.timestamp());
                 continue;
             }
+            // cooldown: do not reopen right after the same alert was resolved
+            if (isCoolingDown(e.tenantId(), fp, rule)) continue;
             IncidentEntity incident = incidents.save(
                     new IncidentEntity(e.tenantId(), rule.getId(), fp,
                             rule.getName(),
@@ -72,6 +74,17 @@ public class AlertEvaluationService {
                 throw new IllegalStateException("Could not serialize incident notification", jsonError);
             }
         }
+    }
+
+    /** True while "resolved_at + cooldownSeconds" of the latest resolved incident for this alert is still in the future. */
+    private boolean isCoolingDown(String tenantId, String fingerprint, RuleEntity rule) {
+        if (rule.getCooldownSeconds() <= 0) return false;
+        return incidents
+                .findFirstByTenantIdAndFingerprintAndStatusOrderByResolvedAtDesc(tenantId, fingerprint, "RESOLVED")
+                .map(IncidentEntity::getResolvedAt)
+                .filter(resolvedAt -> resolvedAt != null
+                        && resolvedAt.plusSeconds(rule.getCooldownSeconds()).isAfter(Instant.now()))
+                .isPresent();
     }
 
     private boolean matches(RuleEntity r, ProcessedLogEvent e) {
