@@ -1,5 +1,6 @@
 server:
   port: 8085
+  shutdown: graceful
 spring:
   application:
     name: query-service
@@ -17,8 +18,13 @@ spring:
         format_sql: true
   flyway:
     enabled: false
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}

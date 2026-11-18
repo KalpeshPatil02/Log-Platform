@@ -1,5 +1,6 @@
 server:
   port: 8081
+  shutdown: graceful
 
 spring:
   application:
@@ -27,14 +28,20 @@ spring:
       pageable:
         max-page-size: 100
 
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
   endpoint:
     health:
       show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
 
 identity:
   jwt:

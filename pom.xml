@@ -12,6 +12,7 @@
     <jjwt.version>0.12.6</jjwt.version>
     <!-- Newer Flyway for reliable MySQL 8.4 support -->
     <flyway.version>10.17.3</flyway.version>
+    <micrometer.version>1.13.4</micrometer.version>
   </properties>
   <!-- Modules are added phase by phase. -->
   <modules>
@@ -23,6 +24,7 @@
     <module>processing-service</module>
     <module>query-service</module>
     <module>alert-service</module>
+    <module>notification-service</module>
 </modules>
   <dependencyManagement>
     <dependencies>
@@ -34,6 +36,8 @@
       <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-api</artifactId><version>${jjwt.version}</version></dependency>
       <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-impl</artifactId><version>${jjwt.version}</version></dependency>
       <dependency><groupId>io.jsonwebtoken</groupId><artifactId>jjwt-jackson</artifactId><version>${jjwt.version}</version></dependency>
+      <!-- Micrometer Prometheus registry for all services -->
+      <dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId><version>${micrometer.version}</version></dependency>
     </dependencies>
   </dependencyManagement>
   <build>

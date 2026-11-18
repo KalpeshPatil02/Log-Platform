@@ -26,6 +26,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * Validates, stamps with trusted tenant context, de-duplicates by (tenant, eventId) and appends to logs.raw (XADD).
@@ -40,12 +42,20 @@ public class LogProducer {
     private final ObjectMapper mapper;
     private final IngestionProperties props;
     private final RedisScript<List> atomicPublishScript;
+    private final Counter ingestedTotal;
+    private final Counter ingestedRejected;
 
-    public LogProducer(StringRedisTemplate redis, ObjectMapper mapper, IngestionProperties props, RedisScript<List> atomicPublishScript) {
+    public LogProducer(StringRedisTemplate redis, ObjectMapper mapper, IngestionProperties props, RedisScript<List> atomicPublishScript, MeterRegistry registry) {
         this.redis = redis;
         this.mapper = mapper;
         this.props = props;
         this.atomicPublishScript = atomicPublishScript;
+        this.ingestedTotal = Counter.builder("logs.ingested.total")
+                .tag("application", "ingestion-service")
+                .register(registry);
+        this.ingestedRejected = Counter.builder("logs.ingested.rejected")
+                .tag("application", "ingestion-service")
+                .register(registry);
     }
 
     public record PublishResult(int accepted, int duplicates, int generatedEventIds, List<String> eventIds) {}
@@ -92,6 +102,8 @@ public class LogProducer {
         }
         int accepted = Integer.parseInt(result.get(0).toString());
         int duplicates = Integer.parseInt(result.get(1).toString()) + inRequestDuplicates;
+        ingestedTotal.increment(accepted);
+        ingestedRejected.increment(duplicates);
         return new PublishResult(accepted, duplicates, generated, records.stream()
                 .map(r -> r.get(LogFields.EVENT_ID)).toList());
     }

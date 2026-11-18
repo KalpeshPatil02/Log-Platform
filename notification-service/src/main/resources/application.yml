@@ -1,0 +1,54 @@
+server:
+  port: 8086
+  shutdown: graceful
+
+spring:
+  application:
+    name: notification-service
+  datasource:
+    url: jdbc:mysql://mysql:3306/notification_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    username: notification_svc
+    password: ${NOTIFICATION_DB_PASSWORD:}
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+app:
+  notification:
+    stream: notifications.out
+    consumerGroup: notification-service
+    consumerName: ${NOTIFICATION_CONSUMER_NAME:notification-${HOSTNAME:-localhost}-${java.util.UUID.randomUUID}}
+    pollDelayMs: 1000
+    pendingIdleMs: 60000
+    maxDeliveries: 5
+    backoffBaseMs: 1000
+    backoffMaxMs: 3600000
+    emailEnabled: false
+    slackEnabled: false
+    webhookEnabled: true
+    smtpHost: smtp.gmail.com
+    smtpPort: 587
+    smtpUsername: ${SMTP_USERNAME:}
+    smtpPassword: ${SMTP_PASSWORD:}
+    slackWebhookUrl: ${SLACK_WEBHOOK_URL:}
+    webhookBaseUrl: ${WEBHOOK_BASE_URL:}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  level:
+    com.logplatform.notification: INFO

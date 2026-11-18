@@ -9,6 +9,7 @@ import com.logplatform.alert.repository.NotificationOutboxRepository;
 import com.logplatform.alert.repository.RuleRepository;
 import com.logplatform.common.ProcessedLogEvent;
 import com.logplatform.common.Severity;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -30,6 +31,7 @@ class AlertEvaluationServiceTest {
     private SlidingWindowCounter counter;
     private StringRedisTemplate redis;
     private AlertEvaluationService evaluator;
+    private SimpleMeterRegistry registry = new SimpleMeterRegistry();
 
     private final Instant eventTime = Instant.parse("2026-11-14T04:00:00Z");
 
@@ -55,7 +57,7 @@ class AlertEvaluationServiceTest {
         );
 
         evaluator = new AlertEvaluationService(
-                rules, incidents, outbox, counter, redis, new ObjectMapper(), properties
+                rules, incidents, outbox, counter, redis, new ObjectMapper(), properties, registry
         );
     }
 

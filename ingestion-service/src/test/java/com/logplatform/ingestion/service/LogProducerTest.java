@@ -10,6 +10,7 @@ import com.logplatform.common.ApiException;
 import com.logplatform.ingestion.config.IngestionProperties;
 import com.logplatform.ingestion.dto.LogEventRequest;
 import com.logplatform.ingestion.security.ApiKeyPrincipal;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,13 +29,14 @@ class LogProducerTest {
     @Mock StreamOperations<String, Object, Object> streams;
     @Mock RedisScript<List> script;
     LogProducer producer;
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
 
     @BeforeEach
     void setUp() {
         lenient().when(redis.opsForStream()).thenReturn(streams);
         IngestionProperties props = new IngestionProperties("http://identity", "t", 100, Duration.ofHours(24),
                 new IngestionProperties.Cache(Duration.ofMinutes(5), Duration.ofSeconds(30)), false);
-        producer = new LogProducer(redis, new ObjectMapper(), props, script);
+        producer = new LogProducer(redis, new ObjectMapper(), props, script, registry);
     }
 
     private static LogEventRequest event(String id) {
@@ -65,7 +67,7 @@ class LogProducerTest {
     void requireEventIdRejectsMissingIdBeforeRedisWrite() {
         IngestionProperties props = new IngestionProperties("http://identity", "t", 100, Duration.ofHours(24),
                 new IngestionProperties.Cache(Duration.ofMinutes(5), Duration.ofSeconds(30)), true);
-        producer = new LogProducer(redis, new ObjectMapper(), props, script);
+        producer = new LogProducer(redis, new ObjectMapper(), props, script, registry);
         when(streams.size("logs.raw")).thenReturn(0L);
         assertThatThrownBy(() -> producer.publish(PRINCIPAL, null, List.of(event(null))))
                 .isInstanceOf(ApiException.class).hasMessageContaining("eventId is required");

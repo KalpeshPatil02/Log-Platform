@@ -38,4 +38,7 @@ public interface ProcessedLogRepository
          @Param("correlationId") String correlationId,
          @Param("attributes") String attributes
  );
+
+ @Query("SELECT e FROM ProcessedLogEntity e WHERE e.eventId = :eventId")
+ ProcessedLogEntity findByEventId(@Param("eventId") String eventId);
 }

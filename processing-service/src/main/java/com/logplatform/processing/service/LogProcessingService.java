@@ -6,6 +6,8 @@ import com.logplatform.processing.domain.RawLogEvent;
 import com.logplatform.processing.persistence.OutboxEventEntity;
 import com.logplatform.processing.persistence.OutboxEventRepository;
 import com.logplatform.processing.persistence.ProcessedLogRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,17 +20,26 @@ public class LogProcessingService {
  private final ProcessedLogRepository logs;
  private final OutboxEventRepository outbox;
  private final ObjectMapper mapper;
+ private final Counter processedTotal;
+ private final Counter processedFailed;
 
  public LogProcessingService(
          LogNormalizer normalizer,
          ProcessedLogRepository logs,
          OutboxEventRepository outbox,
-         ObjectMapper mapper
+         ObjectMapper mapper,
+         MeterRegistry registry
  ) {
   this.normalizer = normalizer;
   this.logs = logs;
   this.outbox = outbox;
   this.mapper = mapper;
+  this.processedTotal = Counter.builder("logs.processed.total")
+          .tag("application", "processing-service")
+          .register(registry);
+  this.processedFailed = Counter.builder("logs.processed.failed")
+          .tag("application", "processing-service")
+          .register(registry);
  }
 
  @Transactional
@@ -60,7 +71,10 @@ public class LogProcessingService {
            log.attributes()
    );
 
+   processedTotal.increment();
+
   } catch (Exception exception) {
+   processedFailed.increment();
    throw new IllegalStateException(
            "Could not process log event", exception
    );
