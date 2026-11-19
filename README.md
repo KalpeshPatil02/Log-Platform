@@ -58,7 +58,7 @@ Client → API Gateway → Ingestion Service → Redis Stream (logs.raw)
 - **Redis 7.2** — Streams for async communication, PEL (Pending Entries List) for crash recovery
 - **Prometheus** — Metrics collection (scrapes `/actuator/prometheus` from all services)
 - **Grafana** — Dashboards for platform health, JVM, API, DB, pipeline, alerts, notifications
-- "*Docker*"
+- **Docker**
 
 ---
 
